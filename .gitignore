@@ -1,1 +1,10 @@
-.lake
+# Lake build output
+.lake/
+lake-packages/
+
+# Native dependencies (downloaded by build.sh)
+native/lua/
+
+# Build artifacts
+*.o
+*.a
