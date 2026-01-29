@@ -8,6 +8,7 @@ import Selene.FFI.Table
 import Selene.FFI.Function
 import Selene.Core.Value
 import Selene.Core.Error
+import Selene.Core.Callback
 import Selene.Core.Convert
 
 namespace Selene
@@ -120,6 +121,10 @@ def pcall (s : State) (funcName : String) (args : Array Value) : IO (LuaResult (
 /-- Register a Lean function as a Lua global -/
 def registerGlobal (s : State) (name : String) (f : Array Value → IO (Array Value)) : IO Unit :=
   FFI.registerFunction s.raw name f
+
+/-- Register a Lean function as a Lua global that can yield -/
+def registerYielding (s : State) (name : String) (f : Array Value → IO CallbackResult) : IO Unit :=
+  FFI.registerYieldingFunction s.raw name f
 
 /-- Get the current Lua version -/
 def version (s : State) : IO Float :=

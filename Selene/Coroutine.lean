@@ -54,6 +54,14 @@ inductive ResumeResult where
   | error (err : LuaError)            -- Coroutine errored
   deriving Repr, Inhabited
 
+/-- Hooks for coroutine lifecycle events -/
+structure CoroutineHooks where
+  onResume : Array Value → IO Unit := fun _ => pure ()
+  onYield : Array Value → IO Unit := fun _ => pure ()
+  onFinish : Array Value → IO Unit := fun _ => pure ()
+  onError : LuaError → IO Unit := fun _ => pure ()
+  onClose : LuaResult Unit → IO Unit := fun _ => pure ()
+
 /-- High-level coroutine handle -/
 structure Coroutine where
   /-- Parent Lua state that owns this coroutine -/
@@ -115,6 +123,16 @@ def resume (co : Coroutine) (args : Array Value := #[]) : IO ResumeResult := do
       | _ => "Unknown coroutine error"
     return .error (LuaError.ofStatus status msg)
 
+/-- Resume the coroutine with lifecycle hooks. -/
+def resumeWithHooks (co : Coroutine) (hooks : CoroutineHooks) (args : Array Value := #[]) : IO ResumeResult := do
+  hooks.onResume args
+  let result ← co.resume args
+  match result with
+  | .yielded values => hooks.onYield values
+  | .finished values => hooks.onFinish values
+  | .error err => hooks.onError err
+  return result
+
 /-- Close the coroutine thread -/
 def close (co : Coroutine) : IO (LuaResult Unit) := do
   let status ← co.getStatus
@@ -132,6 +150,12 @@ def close (co : Coroutine) : IO (LuaResult Unit) := do
         | .string s => s
         | _ => "Unknown coroutine error"
       return .error (LuaError.ofStatus closeStatus msg)
+
+/-- Close the coroutine thread with lifecycle hooks. -/
+def closeWithHooks (co : Coroutine) (hooks : CoroutineHooks) : IO (LuaResult Unit) := do
+  let result ← co.close
+  hooks.onClose result
+  return result
 
 /-- Wrap the coroutine in a function that resumes it and throws on error. -/
 def wrap (co : Coroutine) : Array Value → IO (Array Value) :=

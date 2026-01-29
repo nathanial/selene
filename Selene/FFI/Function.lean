@@ -4,6 +4,7 @@
 -/
 import Selene.FFI.Types
 import Selene.Core.Value
+import Selene.Core.Callback
 
 namespace Selene.FFI
 
@@ -16,6 +17,12 @@ opaque call : @& LuaState → UInt32 → UInt32 → IO Unit
     The callback receives arguments as an array and returns an array of results. -/
 @[extern "selene_register_function"]
 opaque registerFunction : @& LuaState → @& String → (Array Selene.Value → IO (Array Selene.Value)) → IO Unit
+
+/-- Register a Lean function as a Lua global that can yield.
+    The callback receives arguments as an array and returns a CallbackResult. -/
+@[extern "selene_register_yielding_function"]
+opaque registerYieldingFunction :
+  @& LuaState → @& String → (Array Selene.Value → IO Selene.CallbackResult) → IO Unit
 
 /-- Create a reference to the value on top of stack in the registry.
     Pops the value and returns a LuaRef. -/

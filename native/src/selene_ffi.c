@@ -613,6 +613,83 @@ static int lean_callback_gc(lua_State* L) {
     return 0;
 }
 
+static int lean_yielding_callback_call(lua_State* L, LeanCallbackContext* ctx);
+
+static int lean_yielding_callback_continue(lua_State* L, int status, lua_KContext ctx) {
+    (void)status;
+    return lean_yielding_callback_call(L, (LeanCallbackContext*)ctx);
+}
+
+static int lean_yielding_callback_trampoline(lua_State* L) {
+    LeanCallbackContext* ctx = (LeanCallbackContext*)lua_touserdata(L, lua_upvalueindex(1));
+    return lean_yielding_callback_call(L, ctx);
+}
+
+static int lean_yielding_callback_call(lua_State* L, LeanCallbackContext* ctx) {
+    if (!ctx || !ctx->callback) {
+        lua_pushstring(L, "Invalid callback context");
+        lua_error(L);
+        return 0;
+    }
+
+    /* Build Array of Values from arguments */
+    int nargs = lua_gettop(L);
+    lean_object* args = lean_mk_empty_array();
+    for (int i = 1; i <= nargs; i++) {
+        lean_object* val = lua_to_lean_value(L, i);
+        args = lean_array_push(args, val);
+    }
+
+    /* Call Lean function: callback : Array Value -> IO CallbackResult */
+    lean_inc(ctx->callback);
+    lean_object* io_action = lean_apply_1(ctx->callback, args);
+    lean_object* io_result = lean_apply_1(io_action, lean_io_mk_world());
+
+    /* Check for errors */
+    if (!lean_io_result_is_ok(io_result)) {
+        lean_object* err = lean_io_result_get_error(io_result);
+        const char* msg = "Lean callback error";
+        if (lean_is_ctor(err) && lean_obj_tag(err) == 0) {
+            lean_object* str = lean_ctor_get(err, 0);
+            if (lean_is_string(str)) {
+                msg = lean_string_cstr(str);
+            }
+        }
+        lean_dec(io_result);
+        lua_pushstring(L, msg);
+        lua_error(L);
+        return 0;
+    }
+
+    lean_object* result = lean_io_result_get_value(io_result);
+    if (!lean_is_ctor(result)) {
+        lean_dec(io_result);
+        lua_pushstring(L, "Invalid callback result");
+        lua_error(L);
+        return 0;
+    }
+
+    unsigned tag = lean_obj_tag(result);
+    lean_object* values = lean_ctor_get(result, 0);
+    size_t nresults = lean_array_size(values);
+    for (size_t i = 0; i < nresults; i++) {
+        lean_object* val = lean_array_get_core(values, i);
+        lean_value_to_lua(L, val);
+    }
+    lean_dec(io_result);
+
+    if (tag == 0) {
+        return (int)nresults;
+    }
+    if (tag == 1) {
+        return lua_yieldk(L, (int)nresults, (lua_KContext)ctx, lean_yielding_callback_continue);
+    }
+
+    lua_pushstring(L, "Unknown callback result");
+    lua_error(L);
+    return 0;
+}
+
 LEAN_EXPORT lean_obj_res selene_register_function(
     b_lean_obj_arg state_obj,
     b_lean_obj_arg name_obj,
@@ -635,6 +712,35 @@ LEAN_EXPORT lean_obj_res selene_register_function(
 
     /* Create closure with callback context as upvalue */
     lua_pushcclosure(L, lean_callback_trampoline, 1);
+
+    /* Set as global */
+    lua_setglobal(L, name);
+
+    return lean_io_result_mk_ok(lean_box(0));
+}
+
+LEAN_EXPORT lean_obj_res selene_register_yielding_function(
+    b_lean_obj_arg state_obj,
+    b_lean_obj_arg name_obj,
+    lean_obj_arg callback,
+    lean_obj_arg world
+) {
+    lua_State* L = (lua_State*)lean_get_external_data(state_obj);
+    const char* name = lean_string_cstr(name_obj);
+
+    /* Create userdata for callback context */
+    LeanCallbackContext* ctx = (LeanCallbackContext*)lua_newuserdata(L, sizeof(LeanCallbackContext));
+    ctx->callback = callback;  /* Takes ownership */
+
+    /* Create metatable with __gc for cleanup */
+    if (luaL_newmetatable(L, "LeanCallback")) {
+        lua_pushcfunction(L, lean_callback_gc);
+        lua_setfield(L, -2, "__gc");
+    }
+    lua_setmetatable(L, -2);
+
+    /* Create closure with callback context as upvalue */
+    lua_pushcclosure(L, lean_yielding_callback_trampoline, 1);
 
     /* Set as global */
     lua_setglobal(L, name);

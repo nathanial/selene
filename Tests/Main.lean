@@ -377,6 +377,66 @@ test "Coroutine close" := do
   status ≡ .dead
   lua.close
 
+test "Coroutine hooks" := do
+  let lua ← State.new
+  lua.exec! "function gen() coroutine.yield(1); return 2 end"
+  let co ← lua.newCoroutine "gen"
+  let events ← IO.mkRef (#[] : Array String)
+  let hooks : CoroutineHooks := {
+    onResume := fun _ => events.modify (fun evs => evs.push "resume")
+    onYield := fun _ => events.modify (fun evs => evs.push "yield")
+    onFinish := fun _ => events.modify (fun evs => evs.push "finish")
+    onError := fun _ => events.modify (fun evs => evs.push "error")
+    onClose := fun _ => events.modify (fun evs => evs.push "close")
+  }
+
+  let _ ← co.resumeWithHooks hooks
+  let _ ← co.resumeWithHooks hooks
+  let _ ← co.closeWithHooks hooks
+
+  let evs ← events.get
+  evs.size ≡ 5
+  match evs[0]?, evs[1]?, evs[2]?, evs[3]?, evs[4]? with
+  | some "resume", some "yield", some "resume", some "finish", some "close" => pure ()
+  | _, _, _, _, _ => throw (IO.userError s!"Unexpected events {repr evs}")
+
+  lua.close
+
+test "Coroutine yield from Lean" := do
+  let lua ← State.new
+  let step ← IO.mkRef (0 : Nat)
+  lua.registerYielding "stepper" fun args => do
+    let n ← step.get
+    if n == 0 then
+      step.set 1
+      return .yielded #[Value.integer 10]
+    else
+      let v := args.getD 0 .nil
+      return .returned #[v]
+
+  lua.exec! "function run() return stepper() end"
+  let co ← lua.newCoroutine "run"
+
+  let r1 ← co.resume
+  match r1 with
+  | .yielded vals =>
+    vals.size ≡ 1
+    match vals[0]? with
+    | some (Value.integer 10) => pure ()
+    | _ => throw (IO.userError s!"Expected 10, got {vals[0]?}")
+  | _ => throw (IO.userError s!"Expected yielded, got {repr r1}")
+
+  let r2 ← co.resume #[Value.integer 99]
+  match r2 with
+  | .finished vals =>
+    vals.size ≡ 1
+    match vals[0]? with
+    | some (Value.integer 99) => pure ()
+    | _ => throw (IO.userError s!"Expected 99, got {vals[0]?}")
+  | _ => throw (IO.userError s!"Expected finished, got {repr r2}")
+
+  lua.close
+
 end Tests.Selene
 
 def main (args : List String) : IO UInt32 := runAllSuitesFiltered args

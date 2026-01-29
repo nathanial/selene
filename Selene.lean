@@ -10,6 +10,7 @@ import Selene.FFI.Function
 import Selene.FFI.Coroutine
 import Selene.Core.Value
 import Selene.Core.Error
+import Selene.Core.Callback
 import Selene.Core.Convert
 import Selene.State
 import Selene.Table
