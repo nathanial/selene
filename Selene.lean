@@ -45,6 +45,10 @@ def coroutineFromFunction (s : State) (func : Value) : IO Coroutine := do
     return ⟨s.raw, thread⟩
   | _ => throw (IO.userError "Expected function value")
 
+/-- Create a coroutine from a function Value (alias). -/
+def createCoroutine (s : State) (func : Value) : IO Coroutine :=
+  s.coroutineFromFunction func
+
 /-- Wrap an existing Lua thread Value as a Coroutine -/
 def wrapThread (s : State) (v : Value) : IO Coroutine := do
   match v with
@@ -52,6 +56,24 @@ def wrapThread (s : State) (v : Value) : IO Coroutine := do
     let thread ← FFI.threadState s.raw ref
     return ⟨s.raw, thread⟩
   | _ => throw (IO.userError "Expected thread value")
+
+/-- Get the currently running coroutine and whether it is the main thread. -/
+def runningCoroutine (s : State) : IO (Coroutine × Bool) := do
+  let result ← FFI.runningThread s.raw
+  let thread := result.fst
+  let isMain := result.snd
+  return (⟨s.raw, thread⟩, isMain)
+
+/-- Check if the current thread is yieldable. -/
+def isYieldable (s : State) : IO Bool := do
+  let result ← s.runningCoroutine
+  let co := result.fst
+  co.isYieldable
+
+/-- Wrap a function Value into a resume wrapper (like coroutine.wrap). -/
+def coroutineWrap (s : State) (func : Value) : IO (Array Value → IO (Array Value)) := do
+  let co ← s.coroutineFromFunction func
+  return co.wrap
 
 end State
 

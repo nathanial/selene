@@ -15,6 +15,10 @@ instance : Nonempty LuaThread := inferInstance
 @[extern "selene_new_thread"]
 opaque newThread : @& LuaState → IO LuaThread
 
+/-- Get the currently running thread and whether it is the main thread. -/
+@[extern "selene_running_thread"]
+opaque runningThread : @& LuaState → IO (LuaThread × Bool)
+
 /-- Validate a thread reference and return it. -/
 @[extern "selene_thread_state"]
 opaque threadState : @& LuaState → @& LuaRef → IO LuaThread
@@ -24,9 +28,17 @@ opaque threadState : @& LuaState → @& LuaRef → IO LuaThread
 @[extern "selene_resume"]
 opaque resume : @& LuaThread → UInt32 → IO (Int × Int)
 
+/-- Get coroutine status following Lua coroutine.status semantics. -/
+@[extern "selene_coroutine_status"]
+opaque coroutineStatus : @& LuaState → @& LuaThread → IO Int
+
 /-- Get the status of a coroutine -/
 @[extern "selene_status"]
 opaque status : @& LuaThread → IO Int
+
+/-- Close a coroutine thread (Lua 5.4) -/
+@[extern "selene_close_thread"]
+opaque closeThread : @& LuaState → @& LuaThread → IO Int
 
 /-- Check if a coroutine can yield -/
 @[extern "selene_is_yieldable"]

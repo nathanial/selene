@@ -719,6 +719,36 @@ static lua_State* thread_state_from_ref(LuaRefWrapper* wrapper) {
     return co;
 }
 
+enum {
+    CO_STATUS_RUNNING = 0,
+    CO_STATUS_DEAD = 1,
+    CO_STATUS_SUSPENDED = 2,
+    CO_STATUS_NORMAL = 3
+};
+
+static int coroutine_auxstatus(lua_State* L, lua_State* co) {
+    if (L == co) {
+        return CO_STATUS_RUNNING;
+    }
+
+    switch (lua_status(co)) {
+        case LUA_YIELD:
+            return CO_STATUS_SUSPENDED;
+        case LUA_OK: {
+            lua_Debug ar;
+            if (lua_getstack(co, 0, &ar)) {
+                return CO_STATUS_NORMAL;
+            } else if (lua_gettop(co) == 0) {
+                return CO_STATUS_DEAD;
+            } else {
+                return CO_STATUS_SUSPENDED;
+            }
+        }
+        default:
+            return CO_STATUS_DEAD;
+    }
+}
+
 LEAN_EXPORT lean_obj_res selene_new_thread(b_lean_obj_arg state_obj, lean_obj_arg world) {
     init_external_classes();
 
@@ -734,6 +764,24 @@ LEAN_EXPORT lean_obj_res selene_new_thread(b_lean_obj_arg state_obj, lean_obj_ar
 
     lean_object* obj = lean_alloc_external(g_lua_ref_class, wrapper);
     return lean_io_result_mk_ok(obj);
+}
+
+LEAN_EXPORT lean_obj_res selene_running_thread(b_lean_obj_arg state_obj, lean_obj_arg world) {
+    init_external_classes();
+
+    lua_State* L = (lua_State*)lean_get_external_data(state_obj);
+    int ismain = lua_pushthread(L);
+
+    int ref = luaL_ref(L, LUA_REGISTRYINDEX);
+    LuaRefWrapper* wrapper = (LuaRefWrapper*)malloc(sizeof(LuaRefWrapper));
+    wrapper->L = L;
+    wrapper->ref = ref;
+
+    lean_object* thread_obj = lean_alloc_external(g_lua_ref_class, wrapper);
+    lean_object* pair = lean_alloc_ctor(0, 2, 0);
+    lean_ctor_set(pair, 0, thread_obj);
+    lean_ctor_set(pair, 1, lean_box(ismain ? 1 : 0));
+    return lean_io_result_mk_ok(pair);
 }
 
 LEAN_EXPORT lean_obj_res selene_thread_state(b_lean_obj_arg state_obj, b_lean_obj_arg ref_obj, lean_obj_arg world) {
@@ -772,6 +820,17 @@ LEAN_EXPORT lean_obj_res selene_resume(b_lean_obj_arg co_obj, uint32_t nargs, le
     return lean_io_result_mk_ok(pair);
 }
 
+LEAN_EXPORT lean_obj_res selene_coroutine_status(b_lean_obj_arg state_obj, b_lean_obj_arg co_obj, lean_obj_arg world) {
+    lua_State* L = (lua_State*)lean_get_external_data(state_obj);
+    LuaRefWrapper* wrapper = (LuaRefWrapper*)lean_get_external_data(co_obj);
+    lua_State* co = thread_state_from_ref(wrapper);
+    if (!L || !co) {
+        return mk_io_error("Value is not a thread");
+    }
+    int status = coroutine_auxstatus(L, co);
+    return lean_io_result_mk_ok(lean_int_to_int(status));
+}
+
 LEAN_EXPORT lean_obj_res selene_status(b_lean_obj_arg co_obj, lean_obj_arg world) {
     LuaRefWrapper* wrapper = (LuaRefWrapper*)lean_get_external_data(co_obj);
     lua_State* co = thread_state_from_ref(wrapper);
@@ -779,6 +838,17 @@ LEAN_EXPORT lean_obj_res selene_status(b_lean_obj_arg co_obj, lean_obj_arg world
         return mk_io_error("Value is not a thread");
     }
     int status = lua_status(co);
+    return lean_io_result_mk_ok(lean_int_to_int(status));
+}
+
+LEAN_EXPORT lean_obj_res selene_close_thread(b_lean_obj_arg state_obj, b_lean_obj_arg co_obj, lean_obj_arg world) {
+    lua_State* L = (lua_State*)lean_get_external_data(state_obj);
+    LuaRefWrapper* wrapper = (LuaRefWrapper*)lean_get_external_data(co_obj);
+    lua_State* co = thread_state_from_ref(wrapper);
+    if (!L || !co) {
+        return mk_io_error("Value is not a thread");
+    }
+    int status = lua_closethread(co, L);
     return lean_io_result_mk_ok(lean_int_to_int(status));
 }
 

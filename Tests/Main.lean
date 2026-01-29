@@ -325,6 +325,58 @@ test "Coroutine multiple values" := do
 
   lua.close
 
+test "Coroutine running and yieldable" := do
+  let lua ← State.new
+  let (running, isMain) ← lua.runningCoroutine
+  ensure isMain "Expected running coroutine to be main thread"
+  let runStatus ← running.getStatus
+  runStatus ≡ .running
+  let mainYieldable ← running.isYieldable
+  ensure (!mainYieldable) "Main thread should not be yieldable"
+  let mainYieldable2 ← lua.isYieldable
+  ensure (!mainYieldable2) "Expected main thread not yieldable"
+
+  lua.exec! "function simple() coroutine.yield(); return 1 end"
+  let co ← lua.newCoroutine "simple"
+  let coYieldable ← co.isYieldable
+  ensure coYieldable "Coroutine should be yieldable"
+  lua.close
+
+test "Coroutine wrap" := do
+  let lua ← State.new
+  lua.exec! "function gen() coroutine.yield(10); return 20 end"
+  let co ← lua.newCoroutine "gen"
+  let wrapped := co.wrap
+
+  let r1 ← wrapped #[]
+  r1.size ≡ 1
+  match r1[0]? with
+  | some (Value.integer 10) => pure ()
+  | _ => throw (IO.userError s!"Expected 10, got {r1[0]?}")
+
+  let r2 ← wrapped #[]
+  r2.size ≡ 1
+  match r2[0]? with
+  | some (Value.integer 20) => pure ()
+  | _ => throw (IO.userError s!"Expected 20, got {r2[0]?}")
+
+  lua.close
+
+test "Coroutine close" := do
+  let lua ← State.new
+  lua.exec! "function gen() coroutine.yield(1); return 2 end"
+  let co ← lua.newCoroutine "gen"
+
+  let _ ← co.resume
+  let closeResult ← co.close
+  match closeResult with
+  | .ok _ => pure ()
+  | .error e => throw (IO.userError (toString e))
+
+  let status ← co.getStatus
+  status ≡ .dead
+  lua.close
+
 end Tests.Selene
 
 def main (args : List String) : IO UInt32 := runAllSuitesFiltered args

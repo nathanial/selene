@@ -20,17 +20,30 @@ inductive CoroutineStatus where
   | dead       -- Finished or errored
   deriving Repr, Inhabited, BEq
 
+instance : ToString CoroutineStatus where
+  toString
+    | .suspended => "suspended"
+    | .running => "running"
+    | .normal => "normal"
+    | .dead => "dead"
+
 namespace CoroutineStatus
 
-def fromLuaStatus (status : Int) (isYieldable : Bool) : CoroutineStatus :=
-  if status == FFI.LUA_OK then
-    -- LUA_OK means coroutine finished (dead) or is the main thread
+def fromStatusCode (status : Int) : CoroutineStatus :=
+  if status == 0 then
+    .running
+  else if status == 1 then
     .dead
-  else if status == FFI.LUA_YIELD then
+  else if status == 2 then
     .suspended
+  else if status == 3 then
+    .normal
   else
-    -- Error status means dead
     .dead
+
+def fromLuaStatus (status : Int) (isYieldable : Bool) : CoroutineStatus :=
+  let _ := isYieldable
+  fromStatusCode status
 
 end CoroutineStatus
 
@@ -52,23 +65,21 @@ namespace Coroutine
 
 /-- Get the current status of the coroutine -/
 def getStatus (co : Coroutine) : IO CoroutineStatus := do
-  let status ← FFI.status co.thread
-  if status == FFI.LUA_OK then
-    -- Need to check if it's actually finished or just started
-    let top ← FFI.coGetTop co.thread
-    if top == 0 then
-      return .dead
-    else
-      return .suspended
-  else if status == FFI.LUA_YIELD then
-    return .suspended
-  else
-    return .dead
+  let status ← FFI.coroutineStatus co.parent co.thread
+  return CoroutineStatus.fromStatusCode status
+
+/-- Alias for getStatus -/
+def status (co : Coroutine) : IO CoroutineStatus :=
+  co.getStatus
 
 /-- Check if the coroutine can be resumed -/
 def canResume (co : Coroutine) : IO Bool := do
   let status ← co.getStatus
   return status == .suspended
+
+/-- Check if the coroutine is yieldable -/
+def isYieldable (co : Coroutine) : IO Bool :=
+  FFI.isYieldable co.thread
 
 /-- Resume the coroutine with arguments, returning results or error -/
 def resume (co : Coroutine) (args : Array Value := #[]) : IO ResumeResult := do
@@ -103,6 +114,33 @@ def resume (co : Coroutine) (args : Array Value := #[]) : IO ResumeResult := do
       | .string s => s
       | _ => "Unknown coroutine error"
     return .error (LuaError.ofStatus status msg)
+
+/-- Close the coroutine thread -/
+def close (co : Coroutine) : IO (LuaResult Unit) := do
+  let status ← co.getStatus
+  match status with
+  | .running | .normal =>
+    return .error (.runtime s!"cannot close a {status} coroutine")
+  | .suspended | .dead =>
+    let closeStatus ← FFI.closeThread co.parent co.thread
+    if closeStatus == FFI.LUA_OK then
+      return .ok ()
+    else
+      let errMsg ← FFI.coToValue co.thread (-1)
+      FFI.coPop co.thread 1
+      let msg := match errMsg with
+        | .string s => s
+        | _ => "Unknown coroutine error"
+      return .error (LuaError.ofStatus closeStatus msg)
+
+/-- Wrap the coroutine in a function that resumes it and throws on error. -/
+def wrap (co : Coroutine) : Array Value → IO (Array Value) :=
+  fun args => do
+    let result ← co.resume args
+    match result with
+    | .yielded values => pure values
+    | .finished values => pure values
+    | .error err => throw (IO.userError (toString err))
 
 end Coroutine
 
