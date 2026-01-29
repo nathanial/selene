@@ -7,17 +7,52 @@ import Selene.FFI.State
 import Selene.FFI.Stack
 import Selene.FFI.Table
 import Selene.FFI.Function
+import Selene.FFI.Coroutine
 import Selene.Core.Value
 import Selene.Core.Error
 import Selene.Core.Convert
 import Selene.State
 import Selene.Table
 import Selene.Function
+import Selene.Coroutine
 
 namespace Selene
 
 -- Re-export commonly used types
-export FFI (LuaState LuaRef)
+export FFI (LuaState LuaRef LuaThread)
 export Value (nil bool number integer string table function userdata thread)
+
+namespace State
+
+/-- Create a new coroutine from a global function name -/
+def newCoroutine (s : State) (funcName : String) : IO Coroutine := do
+  -- Create new thread (stored in registry)
+  let thread ← FFI.newThread s.raw
+  -- Get the function and move it to coroutine stack
+  let _ ← FFI.getGlobal s.raw funcName
+  FFI.xmoveToThread s.raw thread 1
+  return ⟨s.raw, thread⟩
+
+/-- Create a coroutine from a function Value -/
+def coroutineFromFunction (s : State) (func : Value) : IO Coroutine := do
+  match func with
+  | .function ref =>
+    -- Create new thread (stored in registry)
+    let thread ← FFI.newThread s.raw
+    -- Push function onto parent stack, then move to coroutine stack
+    FFI.pushRef s.raw ref
+    FFI.xmoveToThread s.raw thread 1
+    return ⟨s.raw, thread⟩
+  | _ => throw (IO.userError "Expected function value")
+
+/-- Wrap an existing Lua thread Value as a Coroutine -/
+def wrapThread (s : State) (v : Value) : IO Coroutine := do
+  match v with
+  | .thread ref =>
+    let thread ← FFI.threadState s.raw ref
+    return ⟨s.raw, thread⟩
+  | _ => throw (IO.userError "Expected thread value")
+
+end State
 
 end Selene

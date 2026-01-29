@@ -167,6 +167,164 @@ test "Protected call" := do
   | .ok _ => throw (IO.userError "Expected error from pcall")
   lua.close
 
+test "Coroutine basic creation" := do
+  let lua ← State.new
+  lua.exec! "function simple() return 42 end"
+  let co ← lua.newCoroutine "simple"
+  let canRes ← co.canResume
+  ensure canRes "Should be able to resume new coroutine"
+  lua.close
+
+test "Coroutine yield and resume" := do
+  let lua ← State.new
+  lua.exec! "function gen() coroutine.yield(1); coroutine.yield(2); return 3 end"
+  let co ← lua.newCoroutine "gen"
+
+  -- First resume: yields 1
+  let r1 ← co.resume
+  match r1 with
+  | .yielded vals =>
+    vals.size ≡ 1
+    match vals[0]? with
+    | some (Value.integer 1) => pure ()
+    | _ => throw (IO.userError s!"Expected integer 1, got {vals[0]?}")
+  | _ => throw (IO.userError s!"Expected yielded, got {repr r1}")
+
+  -- Second resume: yields 2
+  let r2 ← co.resume
+  match r2 with
+  | .yielded vals =>
+    vals.size ≡ 1
+    match vals[0]? with
+    | some (Value.integer 2) => pure ()
+    | _ => throw (IO.userError s!"Expected integer 2, got {vals[0]?}")
+  | _ => throw (IO.userError s!"Expected yielded, got {repr r2}")
+
+  -- Third resume: finishes with 3
+  let r3 ← co.resume
+  match r3 with
+  | .finished vals =>
+    vals.size ≡ 1
+    match vals[0]? with
+    | some (Value.integer 3) => pure ()
+    | _ => throw (IO.userError s!"Expected integer 3, got {vals[0]?}")
+  | _ => throw (IO.userError s!"Expected finished, got {repr r3}")
+
+  lua.close
+
+test "Coroutine with arguments" := do
+  let lua ← State.new
+  lua.exec! "function add(a, b) coroutine.yield(a + b); return a * b end"
+  let co ← lua.newCoroutine "add"
+
+  -- Resume with arguments
+  let r1 ← co.resume #[Value.integer 3, Value.integer 4]
+  match r1 with
+  | .yielded vals =>
+    vals.size ≡ 1
+    match vals[0]? with
+    | some (Value.integer 7) => pure ()  -- 3 + 4 = 7
+    | _ => throw (IO.userError s!"Expected integer 7, got {vals[0]?}")
+  | _ => throw (IO.userError s!"Expected yielded, got {repr r1}")
+
+  -- Resume to finish
+  let r2 ← co.resume
+  match r2 with
+  | .finished vals =>
+    vals.size ≡ 1
+    match vals[0]? with
+    | some (Value.integer 12) => pure ()  -- 3 * 4 = 12
+    | _ => throw (IO.userError s!"Expected integer 12, got {vals[0]?}")
+  | _ => throw (IO.userError s!"Expected finished, got {repr r2}")
+
+  lua.close
+
+test "Coroutine error handling" := do
+  let lua ← State.new
+  lua.exec! "function err() error('test error') end"
+  let co ← lua.newCoroutine "err"
+
+  let result ← co.resume
+  match result with
+  | .error _ => pure ()
+  | _ => throw (IO.userError s!"Expected error, got {repr result}")
+
+  lua.close
+
+test "Coroutine status check" := do
+  let lua ← State.new
+  lua.exec! "function simple() coroutine.yield(); return 1 end"
+  let co ← lua.newCoroutine "simple"
+
+  -- Should be suspended initially (has function to run)
+  let canResume1 ← co.canResume
+  ensure canResume1 "Should be resumable initially"
+
+  -- Resume once (yields)
+  let _ ← co.resume
+  let canResume2 ← co.canResume
+  ensure canResume2 "Should be resumable after yield"
+
+  -- Resume again (finishes)
+  let _ ← co.resume
+  let canResume3 ← co.canResume
+  ensure (!canResume3) "Should not be resumable after finish"
+
+  lua.close
+
+test "Wrap existing thread" := do
+  let lua ← State.new
+  lua.exec! "co = coroutine.create(function() coroutine.yield(42); return 100 end)"
+
+  let coVal ← lua.getGlobal "co"
+  match coVal with
+  | .thread _ =>
+    let co ← lua.wrapThread coVal
+
+    let r1 ← co.resume
+    match r1 with
+    | .yielded vals =>
+      match vals[0]? with
+      | some (Value.integer 42) => pure ()
+      | _ => throw (IO.userError s!"Expected 42, got {vals[0]?}")
+    | _ => throw (IO.userError s!"Expected yielded, got {repr r1}")
+
+    let r2 ← co.resume
+    match r2 with
+    | .finished vals =>
+      match vals[0]? with
+      | some (Value.integer 100) => pure ()
+      | _ => throw (IO.userError s!"Expected 100, got {vals[0]?}")
+    | _ => throw (IO.userError s!"Expected finished, got {repr r2}")
+  | _ => throw (IO.userError s!"Expected thread value, got {coVal}")
+
+  lua.close
+
+test "Coroutine multiple values" := do
+  let lua ← State.new
+  lua.exec! "function multi() coroutine.yield(1, 2, 3); return 4, 5 end"
+  let co ← lua.newCoroutine "multi"
+
+  let r1 ← co.resume
+  match r1 with
+  | .yielded vals =>
+    vals.size ≡ 3
+    match vals[0]?, vals[1]?, vals[2]? with
+    | some (Value.integer 1), some (Value.integer 2), some (Value.integer 3) => pure ()
+    | _, _, _ => throw (IO.userError s!"Expected 1,2,3 got {repr vals}")
+  | _ => throw (IO.userError s!"Expected yielded, got {repr r1}")
+
+  let r2 ← co.resume
+  match r2 with
+  | .finished vals =>
+    vals.size ≡ 2
+    match vals[0]?, vals[1]? with
+    | some (Value.integer 4), some (Value.integer 5) => pure ()
+    | _, _ => throw (IO.userError s!"Expected 4,5 got {repr vals}")
+  | _ => throw (IO.userError s!"Expected finished, got {repr r2}")
+
+  lua.close
+
 end Tests.Selene
 
 def main (args : List String) : IO UInt32 := runAllSuitesFiltered args
