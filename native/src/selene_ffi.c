@@ -504,6 +504,20 @@ LEAN_EXPORT lean_obj_res selene_set_global(b_lean_obj_arg state_obj, b_lean_obj_
     return lean_io_result_mk_ok(lean_box(0));
 }
 
+LEAN_EXPORT lean_obj_res selene_get_metatable(b_lean_obj_arg state_obj, b_lean_obj_arg idx_obj, lean_obj_arg world) {
+    lua_State* L = (lua_State*)lean_get_external_data(state_obj);
+    int idx = (int)lean_int64_of_int(idx_obj);
+    int result = lua_getmetatable(L, idx);
+    return lean_io_result_mk_ok(lean_box(result ? 1 : 0));
+}
+
+LEAN_EXPORT lean_obj_res selene_set_metatable(b_lean_obj_arg state_obj, b_lean_obj_arg idx_obj, lean_obj_arg world) {
+    lua_State* L = (lua_State*)lean_get_external_data(state_obj);
+    int idx = (int)lean_int64_of_int(idx_obj);
+    int result = lua_setmetatable(L, idx);
+    return lean_io_result_mk_ok(lean_box(result ? 1 : 0));
+}
+
 LEAN_EXPORT lean_obj_res selene_raw_len(b_lean_obj_arg state_obj, b_lean_obj_arg idx_obj, lean_obj_arg world) {
     lua_State* L = (lua_State*)lean_get_external_data(state_obj);
     int idx = (int)lean_int64_of_int(idx_obj);

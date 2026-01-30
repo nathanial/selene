@@ -40,6 +40,14 @@ opaque getGlobal : @& LuaState → @& String → IO Int
 @[extern "selene_set_global"]
 opaque setGlobal : @& LuaState → @& String → IO Unit
 
+/-- Get metatable for value at index. Pushes metatable and returns true if present. -/
+@[extern "selene_get_metatable"]
+opaque getMetatable : @& LuaState → Int → IO Bool
+
+/-- Set metatable for value at index. Metatable is on top of stack and is popped. -/
+@[extern "selene_set_metatable"]
+opaque setMetatable : @& LuaState → Int → IO Bool
+
 /-- Get raw length of table/string at index -/
 @[extern "selene_raw_len"]
 opaque rawLen : @& LuaState → Int → IO UInt64

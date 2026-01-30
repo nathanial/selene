@@ -98,6 +98,54 @@ test "Table array operations" := do
   len ≡ 3
   lua.close
 
+test "Table metatable get/set" := do
+  let lua ← State.new
+  let t ← lua.newTable
+  let mt ← lua.newTable
+  lua.tableSet mt "tag" (Value.integer 123)
+  let ok ← lua.setMetatable t (some mt)
+  ensure ok "Expected setMetatable success"
+
+  let mtVal ← lua.getMetatable t
+  match mtVal with
+  | some mtTable =>
+    let tag ← lua.tableGet mtTable "tag"
+    match tag with
+    | .integer n => n ≡ 123
+    | _ => throw (IO.userError "Expected metatable tag")
+  | none => throw (IO.userError "Expected metatable")
+
+  let cleared ← lua.setMetatable t none
+  ensure cleared "Expected clear metatable success"
+
+  let mtVal2 ← lua.getMetatable t
+  match mtVal2 with
+  | none => pure ()
+  | some _ => throw (IO.userError "Expected no metatable after clear")
+
+  lua.close
+
+test "Userdata metatable get/set" := do
+  let lua ← State.new
+  let ioVal ← lua.getGlobal "io"
+  let stdoutVal ← lua.tableGet ioVal "stdout"
+  match stdoutVal with
+  | .userdata _ =>
+    let mt ← lua.newTable
+    lua.tableSet mt "tag" (Value.integer 7)
+    let ok ← lua.setMetatable stdoutVal (some mt)
+    ensure ok "Expected setMetatable on userdata"
+    let mtVal ← lua.getMetatable stdoutVal
+    match mtVal with
+    | some mtTable =>
+      let tag ← lua.tableGet mtTable "tag"
+      match tag with
+      | .integer n => n ≡ 7
+      | _ => throw (IO.userError "Expected userdata metatable tag")
+    | none => throw (IO.userError "Expected userdata metatable")
+  | _ => throw (IO.userError "Expected userdata value")
+  lua.close
+
 test "Value conversion round-trip" := do
   let lua ← State.new
 

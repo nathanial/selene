@@ -135,5 +135,41 @@ def stackSize (s : State) : IO Nat := do
   let top ← FFI.getTop s.raw
   return top.toNat
 
+/-- Get metatable for a table or userdata value. -/
+def getMetatable (s : State) (v : Value) : IO (Option Value) := do
+  match v with
+  | .table ref | .userdata ref =>
+    FFI.pushRef s.raw ref
+    let hasMeta ← FFI.getMetatable s.raw (-1)
+    if hasMeta then
+      let mt ← FFI.toValue s.raw (-1)
+      FFI.pop s.raw 2
+      return some mt
+    else
+      FFI.pop s.raw 1
+      return none
+  | _ => return none
+
+/-- Set metatable for a table or userdata value. Returns true on success. -/
+def setMetatable (s : State) (v : Value) (mt : Option Value) : IO Bool := do
+  match v with
+  | .table ref | .userdata ref =>
+    FFI.pushRef s.raw ref
+    match mt with
+    | none =>
+      FFI.pushNil s.raw
+      let ok ← FFI.setMetatable s.raw (-2)
+      FFI.pop s.raw 1
+      return ok
+    | some (.table metaRef) =>
+      FFI.pushRef s.raw metaRef
+      let ok ← FFI.setMetatable s.raw (-2)
+      FFI.pop s.raw 1
+      return ok
+    | some _ =>
+      FFI.pop s.raw 1
+      return false
+  | _ => return false
+
 end State
 end Selene
