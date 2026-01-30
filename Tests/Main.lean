@@ -146,6 +146,17 @@ test "Userdata metatable get/set" := do
   | _ => throw (IO.userError "Expected userdata value")
   lua.close
 
+test "Userdata finalizer" := do
+  let lua ← State.new
+  let finalized ← IO.mkRef false
+  let ud ← lua.newUserdataWithFinalizer (finalized.set true)
+  lua.setGlobal "ud" ud
+  lua.release ud
+  lua.exec! "ud = nil; collectgarbage('collect'); collectgarbage('collect')"
+  let wasFinalized ← finalized.get
+  ensure wasFinalized "Expected userdata finalizer to run"
+  lua.close
+
 test "Value conversion round-trip" := do
   let lua ← State.new
 

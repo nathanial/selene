@@ -6,6 +6,7 @@ import Selene.FFI.State
 import Selene.FFI.Stack
 import Selene.FFI.Table
 import Selene.FFI.Function
+import Selene.FFI.Userdata
 import Selene.Core.Value
 import Selene.Core.Error
 import Selene.Core.Callback
@@ -134,6 +135,23 @@ def version (s : State) : IO Float :=
 def stackSize (s : State) : IO Nat := do
   let top ← FFI.getTop s.raw
   return top.toNat
+
+/-- Release a registry reference held by a Value. -/
+def release (s : State) (v : Value) : IO Unit := do
+  match v with
+  | .table ref | .function ref | .userdata ref | .thread ref =>
+    FFI.unref s.raw ref
+  | _ => pure ()
+
+/-- Create a new userdata with a no-op finalizer. -/
+def newUserdata (s : State) : IO Value := do
+  let ref ← FFI.newUserdata s.raw (pure ())
+  return .userdata ref
+
+/-- Create a new userdata with a custom finalizer. -/
+def newUserdataWithFinalizer (s : State) (finalizer : IO Unit) : IO Value := do
+  let ref ← FFI.newUserdata s.raw finalizer
+  return .userdata ref
 
 /-- Get metatable for a table or userdata value. -/
 def getMetatable (s : State) (v : Value) : IO (Option Value) := do

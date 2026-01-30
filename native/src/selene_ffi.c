@@ -564,6 +564,29 @@ typedef struct {
     lean_object* callback;  /* Array Value -> IO (Array Value) */
 } LeanCallbackContext;
 
+/* Lean userdata payload */
+typedef struct {
+    lean_object* finalizer;  /* IO Unit */
+} LeanUserdata;
+
+static int selene_userdata_gc(lua_State* L) {
+    LeanUserdata* ud = (LeanUserdata*)lua_touserdata(L, 1);
+    if (!ud || !ud->finalizer) {
+        return 0;
+    }
+
+    lean_object* finalizer = ud->finalizer;
+    ud->finalizer = NULL;
+
+    lean_object* io_result = lean_apply_1(finalizer, lean_io_mk_world());
+    if (lean_io_result_is_ok(io_result)) {
+        /* ignore result */
+    }
+    lean_dec(io_result);
+    lean_dec(finalizer);
+    return 0;
+}
+
 /* Trampoline function that calls back into Lean */
 static int lean_callback_trampoline(lua_State* L) {
     init_external_classes();
@@ -760,6 +783,33 @@ LEAN_EXPORT lean_obj_res selene_register_yielding_function(
     lua_setglobal(L, name);
 
     return lean_io_result_mk_ok(lean_box(0));
+}
+
+LEAN_EXPORT lean_obj_res selene_new_userdata(
+    b_lean_obj_arg state_obj,
+    lean_obj_arg finalizer_obj,
+    lean_obj_arg world
+) {
+    init_external_classes();
+
+    lua_State* L = (lua_State*)lean_get_external_data(state_obj);
+
+    LeanUserdata* ud = (LeanUserdata*)lua_newuserdatauv(L, sizeof(LeanUserdata), 0);
+    ud->finalizer = finalizer_obj;  /* Takes ownership */
+
+    if (luaL_newmetatable(L, "SeleneUserdata")) {
+        lua_pushcfunction(L, selene_userdata_gc);
+        lua_setfield(L, -2, "__gc");
+    }
+    lua_setmetatable(L, -2);
+
+    int ref = luaL_ref(L, LUA_REGISTRYINDEX);
+    LuaRefWrapper* wrapper = (LuaRefWrapper*)malloc(sizeof(LuaRefWrapper));
+    wrapper->L = L;
+    wrapper->ref = ref;
+
+    lean_object* obj = lean_alloc_external(g_lua_ref_class, wrapper);
+    return lean_io_result_mk_ok(obj);
 }
 
 LEAN_EXPORT lean_obj_res selene_ref(b_lean_obj_arg state_obj, lean_obj_arg world) {
