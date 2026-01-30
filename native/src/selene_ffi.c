@@ -9,6 +9,8 @@
 #include <lualib.h>
 #include <string.h>
 #include <stdlib.h>
+#include <pthread.h>
+#include <stdio.h>
 
 /* ========================================================================== */
 /* External Class Registration                                                 */
@@ -21,32 +23,190 @@ static lean_external_class* g_lua_ref_class = NULL;
 typedef struct {
     lua_State* L;
     int ref;
+    uint64_t state_id;
 } LuaRefWrapper;
+
+typedef struct {
+    lua_State* L;
+    uint64_t state_id;
+} LuaStateWrapper;
+
+typedef struct StateNode {
+    lua_State* L;
+    uint64_t id;
+    struct StateNode* next;
+} StateNode;
+
+typedef struct FinalizerNode {
+    lean_object* finalizer;
+    struct FinalizerNode* next;
+} FinalizerNode;
+
+enum {
+    CALLBACK_KIND_NORMAL = 0,
+    CALLBACK_KIND_YIELDING = 1
+};
+
+/* Lean callback context stored as Lua upvalue */
+typedef struct {
+    uint64_t id;
+    uint8_t kind;
+} LeanCallbackContext;
+
+/* Lean-exported registry hooks */
+extern lean_object* selene_callback_invoke(uint64_t id, lean_object* args);
+extern lean_object* selene_yielding_callback_invoke(uint64_t id, lean_object* args);
+extern lean_object* selene_callback_release(uint64_t id);
+extern lean_object* selene_yielding_callback_release(uint64_t id);
+
+static StateNode* g_state_nodes = NULL;
+static uint64_t g_next_state_id = 1;
+static FinalizerNode* g_pending_finalizers = NULL;
+static pthread_mutex_t g_state_mutex = PTHREAD_MUTEX_INITIALIZER;
+static pthread_mutex_t g_finalizer_mutex = PTHREAD_MUTEX_INITIALIZER;
+static pthread_mutex_t g_init_mutex = PTHREAD_MUTEX_INITIALIZER;
+static pthread_mutex_t g_close_mutex = PTHREAD_MUTEX_INITIALIZER;
+static int g_in_state_close = 0;
 
 /* ========================================================================== */
 /* Finalizers                                                                  */
 /* ========================================================================== */
 
-static void lua_state_finalizer(void* ptr) {
-    lua_State* L = (lua_State*)ptr;
-    if (L) {
-        lua_close(L);
+static uint64_t register_state(lua_State* L);
+static void unregister_state(lua_State* L);
+static uint64_t find_state_id(lua_State* L);
+static int is_state_live(lua_State* L, uint64_t id);
+
+static void enqueue_finalizer(lean_object* finalizer) {
+    FinalizerNode* node = (FinalizerNode*)malloc(sizeof(FinalizerNode));
+    node->finalizer = finalizer;
+    pthread_mutex_lock(&g_finalizer_mutex);
+    node->next = g_pending_finalizers;
+    g_pending_finalizers = node;
+    pthread_mutex_unlock(&g_finalizer_mutex);
+}
+
+static void flush_pending_finalizers(void) {
+    pthread_mutex_lock(&g_finalizer_mutex);
+    FinalizerNode* node = g_pending_finalizers;
+    g_pending_finalizers = NULL;
+    pthread_mutex_unlock(&g_finalizer_mutex);
+    while (node) {
+        FinalizerNode* next = node->next;
+        lean_object* finalizer = node->finalizer;
+        lean_object* io_result = lean_apply_1(finalizer, lean_io_mk_world());
+        if (lean_io_result_is_ok(io_result)) {
+            /* ignore result */
+        }
+        lean_dec(io_result);
+        lean_dec(finalizer);
+        free(node);
+        node = next;
     }
+}
+
+static lua_State* state_from_obj(b_lean_obj_arg state_obj) {
+    LuaStateWrapper* state = (LuaStateWrapper*)lean_get_external_data(state_obj);
+    return state ? state->L : NULL;
+}
+
+static void lua_state_finalizer(void* ptr) {
+    LuaStateWrapper* state = (LuaStateWrapper*)ptr;
+    if (!state) {
+        return;
+    }
+    pthread_mutex_lock(&g_close_mutex);
+    if (state->L && is_state_live(state->L, state->state_id)) {
+        unregister_state(state->L);
+        g_in_state_close++;
+        lua_close(state->L);
+        g_in_state_close--;
+    }
+    state->L = NULL;
+    pthread_mutex_unlock(&g_close_mutex);
+    free(state);
 }
 
 static void lua_ref_finalizer(void* ptr) {
     LuaRefWrapper* wrapper = (LuaRefWrapper*)ptr;
-    if (wrapper) {
-        if (wrapper->L && wrapper->ref != LUA_NOREF) {
-            luaL_unref(wrapper->L, LUA_REGISTRYINDEX, wrapper->ref);
-        }
-        free(wrapper);
+    if (!wrapper) {
+        return;
     }
+    if (g_in_state_close > 0) {
+        free(wrapper);
+        return;
+    }
+    if (wrapper->L && wrapper->ref != LUA_NOREF && is_state_live(wrapper->L, wrapper->state_id)) {
+        luaL_unref(wrapper->L, LUA_REGISTRYINDEX, wrapper->ref);
+    }
+    free(wrapper);
 }
 
 static void noop_foreach(void* ptr, b_lean_obj_arg arg) {
     (void)ptr;
     (void)arg;
+}
+
+static uint64_t register_state(lua_State* L) {
+    pthread_mutex_lock(&g_state_mutex);
+    StateNode* node = (StateNode*)malloc(sizeof(StateNode));
+    node->L = L;
+    node->id = g_next_state_id++;
+    node->next = g_state_nodes;
+    g_state_nodes = node;
+    uint64_t id = node->id;
+    pthread_mutex_unlock(&g_state_mutex);
+    return id;
+}
+
+static void unregister_state(lua_State* L) {
+    pthread_mutex_lock(&g_state_mutex);
+    StateNode* prev = NULL;
+    StateNode* cur = g_state_nodes;
+    while (cur) {
+        if (cur->L == L) {
+            if (prev) {
+                prev->next = cur->next;
+            } else {
+                g_state_nodes = cur->next;
+            }
+            free(cur);
+            pthread_mutex_unlock(&g_state_mutex);
+            return;
+        }
+        prev = cur;
+        cur = cur->next;
+    }
+    pthread_mutex_unlock(&g_state_mutex);
+}
+
+static uint64_t find_state_id(lua_State* L) {
+    pthread_mutex_lock(&g_state_mutex);
+    StateNode* cur = g_state_nodes;
+    while (cur) {
+        if (cur->L == L) {
+            uint64_t id = cur->id;
+            pthread_mutex_unlock(&g_state_mutex);
+            return id;
+        }
+        cur = cur->next;
+    }
+    pthread_mutex_unlock(&g_state_mutex);
+    return 0;
+}
+
+static int is_state_live(lua_State* L, uint64_t id) {
+    pthread_mutex_lock(&g_state_mutex);
+    StateNode* cur = g_state_nodes;
+    while (cur) {
+        if (cur->L == L && cur->id == id) {
+            pthread_mutex_unlock(&g_state_mutex);
+            return 1;
+        }
+        cur = cur->next;
+    }
+    pthread_mutex_unlock(&g_state_mutex);
+    return 0;
 }
 
 /* ========================================================================== */
@@ -55,8 +215,12 @@ static void noop_foreach(void* ptr, b_lean_obj_arg arg) {
 
 static void init_external_classes(void) {
     if (g_lua_state_class == NULL) {
-        g_lua_state_class = lean_register_external_class(lua_state_finalizer, noop_foreach);
-        g_lua_ref_class = lean_register_external_class(lua_ref_finalizer, noop_foreach);
+        pthread_mutex_lock(&g_init_mutex);
+        if (g_lua_state_class == NULL) {
+            g_lua_state_class = lean_register_external_class(lua_state_finalizer, noop_foreach);
+            g_lua_ref_class = lean_register_external_class(lua_ref_finalizer, noop_foreach);
+        }
+        pthread_mutex_unlock(&g_init_mutex);
     }
 }
 
@@ -64,6 +228,41 @@ static lean_object* mk_io_error(const char* msg) {
     return lean_io_result_mk_error(lean_mk_io_user_error(lean_mk_string(msg)));
 }
 
+static lean_object* mk_status_message_trace(int status, const char* msg, const char* trace) {
+    lean_object* msg_obj = lean_mk_string(msg ? msg : "");
+    lean_object* trace_obj = lean_mk_string(trace ? trace : "");
+    lean_object* inner = lean_alloc_ctor(0, 2, 0);
+    lean_ctor_set(inner, 0, msg_obj);
+    lean_ctor_set(inner, 1, trace_obj);
+    lean_object* outer = lean_alloc_ctor(0, 2, 0);
+    lean_ctor_set(outer, 0, lean_int_to_int(status));
+    lean_ctor_set(outer, 1, inner);
+    return outer;
+}
+
+static lean_object* selene_error_result(lua_State* L, int status) {
+    const char* msg = "";
+    const char* trace = "";
+    int msg_on_stack = 0;
+
+    if (lua_isstring(L, -1)) {
+        msg = lua_tostring(L, -1);
+    } else {
+        luaL_tolstring(L, -1, NULL);
+        msg = lua_tostring(L, -1);
+        msg_on_stack = 1;
+    }
+
+    luaL_traceback(L, L, msg, 1);
+    trace = lua_tostring(L, -1);
+
+    lean_object* result = mk_status_message_trace(status, msg, trace);
+    lua_pop(L, 1); /* pop traceback */
+    if (msg_on_stack) {
+        lua_pop(L, 1);
+    }
+    return result;
+}
 /* ========================================================================== */
 /* Value Conversion                                                            */
 /* ========================================================================== */
@@ -130,6 +329,7 @@ static lean_object* lua_to_lean_value(lua_State* L, int idx) {
             LuaRefWrapper* wrapper = (LuaRefWrapper*)malloc(sizeof(LuaRefWrapper));
             wrapper->L = L;
             wrapper->ref = ref;
+            wrapper->state_id = find_state_id(L);
 
             lean_object* ref_obj = lean_alloc_external(g_lua_ref_class, wrapper);
 
@@ -212,7 +412,13 @@ LEAN_EXPORT lean_obj_res selene_state_new(lean_obj_arg world) {
         return mk_io_error("Failed to create Lua state");
     }
 
-    lean_object* obj = lean_alloc_external(g_lua_state_class, L);
+    uint64_t state_id = register_state(L);
+
+    LuaStateWrapper* state = (LuaStateWrapper*)malloc(sizeof(LuaStateWrapper));
+    state->L = L;
+    state->state_id = state_id;
+
+    lean_object* obj = lean_alloc_external(g_lua_state_class, state);
     return lean_io_result_mk_ok(obj);
 }
 
@@ -226,56 +432,112 @@ LEAN_EXPORT lean_obj_res selene_state_new_with_libs(lean_obj_arg world) {
 
     luaL_openlibs(L);
 
-    lean_object* obj = lean_alloc_external(g_lua_state_class, L);
+    uint64_t state_id = register_state(L);
+
+    LuaStateWrapper* state = (LuaStateWrapper*)malloc(sizeof(LuaStateWrapper));
+    state->L = L;
+    state->state_id = state_id;
+
+    lean_object* obj = lean_alloc_external(g_lua_state_class, state);
     return lean_io_result_mk_ok(obj);
 }
 
 LEAN_EXPORT lean_obj_res selene_state_close(b_lean_obj_arg state_obj, lean_obj_arg world) {
-    /* No-op: finalizer handles cleanup */
+    (void)world;
+    LuaStateWrapper* state = (LuaStateWrapper*)lean_get_external_data(state_obj);
+    if (!state) {
+        return lean_io_result_mk_ok(lean_box(0));
+    }
+    pthread_mutex_lock(&g_close_mutex);
+    if (state->L && is_state_live(state->L, state->state_id)) {
+        unregister_state(state->L);
+        g_in_state_close++;
+        lua_close(state->L);
+        g_in_state_close--;
+    }
+    state->L = NULL;
+    pthread_mutex_unlock(&g_close_mutex);
+    flush_pending_finalizers();
     return lean_io_result_mk_ok(lean_box(0));
 }
 
 LEAN_EXPORT lean_obj_res selene_do_string(b_lean_obj_arg state_obj, b_lean_obj_arg code_obj, lean_obj_arg world) {
-    lua_State* L = (lua_State*)lean_get_external_data(state_obj);
+    lua_State* L = state_from_obj(state_obj);
     const char* code = lean_string_cstr(code_obj);
 
-    int status = luaL_dostring(L, code);
-    if (status != LUA_OK) {
+    int status = luaL_loadstring(L, code);
+    const char* msg = "";
+    const char* trace = "";
+
+    if (status == LUA_OK) {
+        status = lua_pcall(L, 0, LUA_MULTRET, 0);
+        if (status != LUA_OK) {
+            lean_object* result = selene_error_result(L, status);
+            lua_pop(L, 1);
+            flush_pending_finalizers();
+            return lean_io_result_mk_ok(result);
+        }
+    } else {
         const char* err = lua_tostring(L, -1);
-        lean_object* result = lean_alloc_ctor(1, 1, 0);  /* some */
-        lean_ctor_set(result, 0, lean_mk_string(err ? err : "Unknown error"));
+        msg = err ? err : "Unknown error";
+        trace = "";
+        lean_object* result = mk_status_message_trace(status, msg, trace);
         lua_pop(L, 1);
+        flush_pending_finalizers();
         return lean_io_result_mk_ok(result);
     }
 
-    return lean_io_result_mk_ok(lean_box(0));  /* none */
+    flush_pending_finalizers();
+    return lean_io_result_mk_ok(mk_status_message_trace(LUA_OK, "", ""));
 }
 
 LEAN_EXPORT lean_obj_res selene_do_file(b_lean_obj_arg state_obj, b_lean_obj_arg path_obj, lean_obj_arg world) {
-    lua_State* L = (lua_State*)lean_get_external_data(state_obj);
+    lua_State* L = state_from_obj(state_obj);
     const char* path = lean_string_cstr(path_obj);
 
-    int status = luaL_dofile(L, path);
-    if (status != LUA_OK) {
+    int status = luaL_loadfile(L, path);
+    const char* msg = "";
+    const char* trace = "";
+
+    if (status == LUA_OK) {
+        status = lua_pcall(L, 0, LUA_MULTRET, 0);
+        if (status != LUA_OK) {
+            lean_object* result = selene_error_result(L, status);
+            lua_pop(L, 1);
+            flush_pending_finalizers();
+            return lean_io_result_mk_ok(result);
+        }
+    } else {
         const char* err = lua_tostring(L, -1);
-        lean_object* result = lean_alloc_ctor(1, 1, 0);  /* some */
-        lean_ctor_set(result, 0, lean_mk_string(err ? err : "Unknown error"));
+        msg = err ? err : "Unknown error";
+        trace = "";
+        lean_object* result = mk_status_message_trace(status, msg, trace);
         lua_pop(L, 1);
+        flush_pending_finalizers();
         return lean_io_result_mk_ok(result);
     }
 
-    return lean_io_result_mk_ok(lean_box(0));  /* none */
+    flush_pending_finalizers();
+    return lean_io_result_mk_ok(mk_status_message_trace(LUA_OK, "", ""));
 }
 
 LEAN_EXPORT lean_obj_res selene_pcall(b_lean_obj_arg state_obj, uint32_t nargs, uint32_t nresults, lean_obj_arg world) {
-    lua_State* L = (lua_State*)lean_get_external_data(state_obj);
+    lua_State* L = state_from_obj(state_obj);
     int actual_nresults = (nresults == 0xFFFFFFFF) ? LUA_MULTRET : (int)nresults;
     int status = lua_pcall(L, (int)nargs, actual_nresults, 0);
-    return lean_io_result_mk_ok(lean_int_to_int(status));
+    if (status != LUA_OK) {
+        lean_object* result = selene_error_result(L, status);
+        lua_pop(L, 1);
+        flush_pending_finalizers();
+        return lean_io_result_mk_ok(result);
+    }
+
+    flush_pending_finalizers();
+    return lean_io_result_mk_ok(mk_status_message_trace(status, "", ""));
 }
 
 LEAN_EXPORT lean_obj_res selene_version(b_lean_obj_arg state_obj, lean_obj_arg world) {
-    lua_State* L = (lua_State*)lean_get_external_data(state_obj);
+    lua_State* L = state_from_obj(state_obj);
     lua_Number ver = lua_version(L);
     return lean_io_result_mk_ok(lean_box_float(ver));
 }
@@ -285,32 +547,32 @@ LEAN_EXPORT lean_obj_res selene_version(b_lean_obj_arg state_obj, lean_obj_arg w
 /* ========================================================================== */
 
 LEAN_EXPORT lean_obj_res selene_push_nil(b_lean_obj_arg state_obj, lean_obj_arg world) {
-    lua_State* L = (lua_State*)lean_get_external_data(state_obj);
+    lua_State* L = state_from_obj(state_obj);
     lua_pushnil(L);
     return lean_io_result_mk_ok(lean_box(0));
 }
 
 LEAN_EXPORT lean_obj_res selene_push_boolean(b_lean_obj_arg state_obj, uint8_t val, lean_obj_arg world) {
-    lua_State* L = (lua_State*)lean_get_external_data(state_obj);
+    lua_State* L = state_from_obj(state_obj);
     lua_pushboolean(L, val);
     return lean_io_result_mk_ok(lean_box(0));
 }
 
 LEAN_EXPORT lean_obj_res selene_push_number(b_lean_obj_arg state_obj, double val, lean_obj_arg world) {
-    lua_State* L = (lua_State*)lean_get_external_data(state_obj);
+    lua_State* L = state_from_obj(state_obj);
     lua_pushnumber(L, val);
     return lean_io_result_mk_ok(lean_box(0));
 }
 
 LEAN_EXPORT lean_obj_res selene_push_integer(b_lean_obj_arg state_obj, b_lean_obj_arg val_obj, lean_obj_arg world) {
-    lua_State* L = (lua_State*)lean_get_external_data(state_obj);
+    lua_State* L = state_from_obj(state_obj);
     lua_Integer val = lean_int64_of_int(val_obj);
     lua_pushinteger(L, val);
     return lean_io_result_mk_ok(lean_box(0));
 }
 
 LEAN_EXPORT lean_obj_res selene_push_string(b_lean_obj_arg state_obj, b_lean_obj_arg str_obj, lean_obj_arg world) {
-    lua_State* L = (lua_State*)lean_get_external_data(state_obj);
+    lua_State* L = state_from_obj(state_obj);
     const char* str = lean_string_cstr(str_obj);
     size_t len = lean_string_size(str_obj) - 1;
     lua_pushlstring(L, str, len);
@@ -318,28 +580,28 @@ LEAN_EXPORT lean_obj_res selene_push_string(b_lean_obj_arg state_obj, b_lean_obj
 }
 
 LEAN_EXPORT lean_obj_res selene_to_boolean(b_lean_obj_arg state_obj, b_lean_obj_arg idx_obj, lean_obj_arg world) {
-    lua_State* L = (lua_State*)lean_get_external_data(state_obj);
+    lua_State* L = state_from_obj(state_obj);
     int idx = (int)lean_int64_of_int(idx_obj);
     int result = lua_toboolean(L, idx);
     return lean_io_result_mk_ok(lean_box(result ? 1 : 0));
 }
 
 LEAN_EXPORT lean_obj_res selene_to_number(b_lean_obj_arg state_obj, b_lean_obj_arg idx_obj, lean_obj_arg world) {
-    lua_State* L = (lua_State*)lean_get_external_data(state_obj);
+    lua_State* L = state_from_obj(state_obj);
     int idx = (int)lean_int64_of_int(idx_obj);
     lua_Number result = lua_tonumber(L, idx);
     return lean_io_result_mk_ok(lean_box_float(result));
 }
 
 LEAN_EXPORT lean_obj_res selene_to_integer(b_lean_obj_arg state_obj, b_lean_obj_arg idx_obj, lean_obj_arg world) {
-    lua_State* L = (lua_State*)lean_get_external_data(state_obj);
+    lua_State* L = state_from_obj(state_obj);
     int idx = (int)lean_int64_of_int(idx_obj);
     lua_Integer result = lua_tointeger(L, idx);
     return lean_io_result_mk_ok(lean_int64_to_int(result));
 }
 
 LEAN_EXPORT lean_obj_res selene_to_string(b_lean_obj_arg state_obj, b_lean_obj_arg idx_obj, lean_obj_arg world) {
-    lua_State* L = (lua_State*)lean_get_external_data(state_obj);
+    lua_State* L = state_from_obj(state_obj);
     int idx = (int)lean_int64_of_int(idx_obj);
     size_t len;
     const char* str = lua_tolstring(L, idx, &len);
@@ -350,95 +612,95 @@ LEAN_EXPORT lean_obj_res selene_to_string(b_lean_obj_arg state_obj, b_lean_obj_a
 }
 
 LEAN_EXPORT lean_obj_res selene_type(b_lean_obj_arg state_obj, b_lean_obj_arg idx_obj, lean_obj_arg world) {
-    lua_State* L = (lua_State*)lean_get_external_data(state_obj);
+    lua_State* L = state_from_obj(state_obj);
     int idx = (int)lean_int64_of_int(idx_obj);
     int t = lua_type(L, idx);
     return lean_io_result_mk_ok(lean_int_to_int(t));
 }
 
 LEAN_EXPORT lean_obj_res selene_typename(b_lean_obj_arg state_obj, b_lean_obj_arg tp_obj, lean_obj_arg world) {
-    lua_State* L = (lua_State*)lean_get_external_data(state_obj);
+    lua_State* L = state_from_obj(state_obj);
     int tp = (int)lean_int64_of_int(tp_obj);
     const char* name = lua_typename(L, tp);
     return lean_io_result_mk_ok(lean_mk_string(name ? name : ""));
 }
 
 LEAN_EXPORT lean_obj_res selene_pop(b_lean_obj_arg state_obj, uint32_t n, lean_obj_arg world) {
-    lua_State* L = (lua_State*)lean_get_external_data(state_obj);
+    lua_State* L = state_from_obj(state_obj);
     lua_pop(L, (int)n);
     return lean_io_result_mk_ok(lean_box(0));
 }
 
 LEAN_EXPORT lean_obj_res selene_get_top(b_lean_obj_arg state_obj, lean_obj_arg world) {
-    lua_State* L = (lua_State*)lean_get_external_data(state_obj);
+    lua_State* L = state_from_obj(state_obj);
     int top = lua_gettop(L);
     return lean_io_result_mk_ok(lean_int_to_int(top));
 }
 
 LEAN_EXPORT lean_obj_res selene_set_top(b_lean_obj_arg state_obj, b_lean_obj_arg idx_obj, lean_obj_arg world) {
-    lua_State* L = (lua_State*)lean_get_external_data(state_obj);
+    lua_State* L = state_from_obj(state_obj);
     int idx = (int)lean_int64_of_int(idx_obj);
     lua_settop(L, idx);
     return lean_io_result_mk_ok(lean_box(0));
 }
 
 LEAN_EXPORT lean_obj_res selene_push_value(b_lean_obj_arg state_obj, b_lean_obj_arg idx_obj, lean_obj_arg world) {
-    lua_State* L = (lua_State*)lean_get_external_data(state_obj);
+    lua_State* L = state_from_obj(state_obj);
     int idx = (int)lean_int64_of_int(idx_obj);
     lua_pushvalue(L, idx);
     return lean_io_result_mk_ok(lean_box(0));
 }
 
 LEAN_EXPORT lean_obj_res selene_check_stack(b_lean_obj_arg state_obj, uint32_t n, lean_obj_arg world) {
-    lua_State* L = (lua_State*)lean_get_external_data(state_obj);
+    lua_State* L = state_from_obj(state_obj);
     int ok = lua_checkstack(L, (int)n);
     return lean_io_result_mk_ok(lean_box(ok ? 1 : 0));
 }
 
 LEAN_EXPORT lean_obj_res selene_is_nil(b_lean_obj_arg state_obj, b_lean_obj_arg idx_obj, lean_obj_arg world) {
-    lua_State* L = (lua_State*)lean_get_external_data(state_obj);
+    lua_State* L = state_from_obj(state_obj);
     int idx = (int)lean_int64_of_int(idx_obj);
     int result = lua_isnil(L, idx);
     return lean_io_result_mk_ok(lean_box(result ? 1 : 0));
 }
 
 LEAN_EXPORT lean_obj_res selene_is_boolean(b_lean_obj_arg state_obj, b_lean_obj_arg idx_obj, lean_obj_arg world) {
-    lua_State* L = (lua_State*)lean_get_external_data(state_obj);
+    lua_State* L = state_from_obj(state_obj);
     int idx = (int)lean_int64_of_int(idx_obj);
     int result = lua_isboolean(L, idx);
     return lean_io_result_mk_ok(lean_box(result ? 1 : 0));
 }
 
 LEAN_EXPORT lean_obj_res selene_is_number(b_lean_obj_arg state_obj, b_lean_obj_arg idx_obj, lean_obj_arg world) {
-    lua_State* L = (lua_State*)lean_get_external_data(state_obj);
+    lua_State* L = state_from_obj(state_obj);
     int idx = (int)lean_int64_of_int(idx_obj);
     int result = lua_isnumber(L, idx);
     return lean_io_result_mk_ok(lean_box(result ? 1 : 0));
 }
 
 LEAN_EXPORT lean_obj_res selene_is_integer(b_lean_obj_arg state_obj, b_lean_obj_arg idx_obj, lean_obj_arg world) {
-    lua_State* L = (lua_State*)lean_get_external_data(state_obj);
+    lua_State* L = state_from_obj(state_obj);
     int idx = (int)lean_int64_of_int(idx_obj);
     int result = lua_isinteger(L, idx);
     return lean_io_result_mk_ok(lean_box(result ? 1 : 0));
 }
 
 LEAN_EXPORT lean_obj_res selene_is_string(b_lean_obj_arg state_obj, b_lean_obj_arg idx_obj, lean_obj_arg world) {
-    lua_State* L = (lua_State*)lean_get_external_data(state_obj);
+    lua_State* L = state_from_obj(state_obj);
     int idx = (int)lean_int64_of_int(idx_obj);
     int result = lua_isstring(L, idx);
     return lean_io_result_mk_ok(lean_box(result ? 1 : 0));
 }
 
 LEAN_EXPORT lean_obj_res selene_is_table(b_lean_obj_arg state_obj, b_lean_obj_arg idx_obj, lean_obj_arg world) {
-    lua_State* L = (lua_State*)lean_get_external_data(state_obj);
+    lua_State* L = state_from_obj(state_obj);
     int idx = (int)lean_int64_of_int(idx_obj);
     int result = lua_istable(L, idx);
     return lean_io_result_mk_ok(lean_box(result ? 1 : 0));
 }
 
 LEAN_EXPORT lean_obj_res selene_is_function(b_lean_obj_arg state_obj, b_lean_obj_arg idx_obj, lean_obj_arg world) {
-    lua_State* L = (lua_State*)lean_get_external_data(state_obj);
+    lua_State* L = state_from_obj(state_obj);
     int idx = (int)lean_int64_of_int(idx_obj);
     int result = lua_isfunction(L, idx);
     return lean_io_result_mk_ok(lean_box(result ? 1 : 0));
@@ -449,33 +711,33 @@ LEAN_EXPORT lean_obj_res selene_is_function(b_lean_obj_arg state_obj, b_lean_obj
 /* ========================================================================== */
 
 LEAN_EXPORT lean_obj_res selene_new_table(b_lean_obj_arg state_obj, lean_obj_arg world) {
-    lua_State* L = (lua_State*)lean_get_external_data(state_obj);
+    lua_State* L = state_from_obj(state_obj);
     lua_newtable(L);
     return lean_io_result_mk_ok(lean_box(0));
 }
 
 LEAN_EXPORT lean_obj_res selene_create_table(b_lean_obj_arg state_obj, uint32_t narr, uint32_t nrec, lean_obj_arg world) {
-    lua_State* L = (lua_State*)lean_get_external_data(state_obj);
+    lua_State* L = state_from_obj(state_obj);
     lua_createtable(L, (int)narr, (int)nrec);
     return lean_io_result_mk_ok(lean_box(0));
 }
 
 LEAN_EXPORT lean_obj_res selene_get_table(b_lean_obj_arg state_obj, b_lean_obj_arg idx_obj, lean_obj_arg world) {
-    lua_State* L = (lua_State*)lean_get_external_data(state_obj);
+    lua_State* L = state_from_obj(state_obj);
     int idx = (int)lean_int64_of_int(idx_obj);
     int t = lua_gettable(L, idx);
     return lean_io_result_mk_ok(lean_int_to_int(t));
 }
 
 LEAN_EXPORT lean_obj_res selene_set_table(b_lean_obj_arg state_obj, b_lean_obj_arg idx_obj, lean_obj_arg world) {
-    lua_State* L = (lua_State*)lean_get_external_data(state_obj);
+    lua_State* L = state_from_obj(state_obj);
     int idx = (int)lean_int64_of_int(idx_obj);
     lua_settable(L, idx);
     return lean_io_result_mk_ok(lean_box(0));
 }
 
 LEAN_EXPORT lean_obj_res selene_get_field(b_lean_obj_arg state_obj, b_lean_obj_arg idx_obj, b_lean_obj_arg name_obj, lean_obj_arg world) {
-    lua_State* L = (lua_State*)lean_get_external_data(state_obj);
+    lua_State* L = state_from_obj(state_obj);
     int idx = (int)lean_int64_of_int(idx_obj);
     const char* name = lean_string_cstr(name_obj);
     int t = lua_getfield(L, idx, name);
@@ -483,7 +745,7 @@ LEAN_EXPORT lean_obj_res selene_get_field(b_lean_obj_arg state_obj, b_lean_obj_a
 }
 
 LEAN_EXPORT lean_obj_res selene_set_field(b_lean_obj_arg state_obj, b_lean_obj_arg idx_obj, b_lean_obj_arg name_obj, lean_obj_arg world) {
-    lua_State* L = (lua_State*)lean_get_external_data(state_obj);
+    lua_State* L = state_from_obj(state_obj);
     int idx = (int)lean_int64_of_int(idx_obj);
     const char* name = lean_string_cstr(name_obj);
     lua_setfield(L, idx, name);
@@ -491,42 +753,42 @@ LEAN_EXPORT lean_obj_res selene_set_field(b_lean_obj_arg state_obj, b_lean_obj_a
 }
 
 LEAN_EXPORT lean_obj_res selene_get_global(b_lean_obj_arg state_obj, b_lean_obj_arg name_obj, lean_obj_arg world) {
-    lua_State* L = (lua_State*)lean_get_external_data(state_obj);
+    lua_State* L = state_from_obj(state_obj);
     const char* name = lean_string_cstr(name_obj);
     int t = lua_getglobal(L, name);
     return lean_io_result_mk_ok(lean_int_to_int(t));
 }
 
 LEAN_EXPORT lean_obj_res selene_set_global(b_lean_obj_arg state_obj, b_lean_obj_arg name_obj, lean_obj_arg world) {
-    lua_State* L = (lua_State*)lean_get_external_data(state_obj);
+    lua_State* L = state_from_obj(state_obj);
     const char* name = lean_string_cstr(name_obj);
     lua_setglobal(L, name);
     return lean_io_result_mk_ok(lean_box(0));
 }
 
 LEAN_EXPORT lean_obj_res selene_get_metatable(b_lean_obj_arg state_obj, b_lean_obj_arg idx_obj, lean_obj_arg world) {
-    lua_State* L = (lua_State*)lean_get_external_data(state_obj);
+    lua_State* L = state_from_obj(state_obj);
     int idx = (int)lean_int64_of_int(idx_obj);
     int result = lua_getmetatable(L, idx);
     return lean_io_result_mk_ok(lean_box(result ? 1 : 0));
 }
 
 LEAN_EXPORT lean_obj_res selene_set_metatable(b_lean_obj_arg state_obj, b_lean_obj_arg idx_obj, lean_obj_arg world) {
-    lua_State* L = (lua_State*)lean_get_external_data(state_obj);
+    lua_State* L = state_from_obj(state_obj);
     int idx = (int)lean_int64_of_int(idx_obj);
     int result = lua_setmetatable(L, idx);
     return lean_io_result_mk_ok(lean_box(result ? 1 : 0));
 }
 
 LEAN_EXPORT lean_obj_res selene_raw_len(b_lean_obj_arg state_obj, b_lean_obj_arg idx_obj, lean_obj_arg world) {
-    lua_State* L = (lua_State*)lean_get_external_data(state_obj);
+    lua_State* L = state_from_obj(state_obj);
     int idx = (int)lean_int64_of_int(idx_obj);
     lua_Unsigned len = lua_rawlen(L, idx);
     return lean_io_result_mk_ok(lean_box_uint64(len));
 }
 
 LEAN_EXPORT lean_obj_res selene_raw_geti(b_lean_obj_arg state_obj, b_lean_obj_arg idx_obj, b_lean_obj_arg i_obj, lean_obj_arg world) {
-    lua_State* L = (lua_State*)lean_get_external_data(state_obj);
+    lua_State* L = state_from_obj(state_obj);
     int idx = (int)lean_int64_of_int(idx_obj);
     lua_Integer i = lean_int64_of_int(i_obj);
     int t = lua_rawgeti(L, idx, i);
@@ -534,7 +796,7 @@ LEAN_EXPORT lean_obj_res selene_raw_geti(b_lean_obj_arg state_obj, b_lean_obj_ar
 }
 
 LEAN_EXPORT lean_obj_res selene_raw_seti(b_lean_obj_arg state_obj, b_lean_obj_arg idx_obj, b_lean_obj_arg i_obj, lean_obj_arg world) {
-    lua_State* L = (lua_State*)lean_get_external_data(state_obj);
+    lua_State* L = state_from_obj(state_obj);
     int idx = (int)lean_int64_of_int(idx_obj);
     lua_Integer i = lean_int64_of_int(i_obj);
     lua_rawseti(L, idx, i);
@@ -542,7 +804,7 @@ LEAN_EXPORT lean_obj_res selene_raw_seti(b_lean_obj_arg state_obj, b_lean_obj_ar
 }
 
 LEAN_EXPORT lean_obj_res selene_next(b_lean_obj_arg state_obj, b_lean_obj_arg idx_obj, lean_obj_arg world) {
-    lua_State* L = (lua_State*)lean_get_external_data(state_obj);
+    lua_State* L = state_from_obj(state_obj);
     int idx = (int)lean_int64_of_int(idx_obj);
     int result = lua_next(L, idx);
     return lean_io_result_mk_ok(lean_box(result ? 1 : 0));
@@ -553,16 +815,13 @@ LEAN_EXPORT lean_obj_res selene_next(b_lean_obj_arg state_obj, b_lean_obj_arg id
 /* ========================================================================== */
 
 LEAN_EXPORT lean_obj_res selene_call(b_lean_obj_arg state_obj, uint32_t nargs, uint32_t nresults, lean_obj_arg world) {
-    lua_State* L = (lua_State*)lean_get_external_data(state_obj);
+    lua_State* L = state_from_obj(state_obj);
     int actual_nresults = (nresults == 0xFFFFFFFF) ? LUA_MULTRET : (int)nresults;
     lua_call(L, (int)nargs, actual_nresults);
+    flush_pending_finalizers();
     return lean_io_result_mk_ok(lean_box(0));
 }
 
-/* Lean callback context stored as upvalue */
-typedef struct {
-    lean_object* callback;  /* Array Value -> IO (Array Value) */
-} LeanCallbackContext;
 
 /* Lean userdata payload */
 typedef struct {
@@ -578,6 +837,10 @@ static int selene_userdata_gc(lua_State* L) {
     lean_object* finalizer = ud->finalizer;
     ud->finalizer = NULL;
 
+    if (g_in_state_close > 0) {
+        lean_dec(finalizer);
+        return 0;
+    }
     lean_object* io_result = lean_apply_1(finalizer, lean_io_mk_world());
     if (lean_io_result_is_ok(io_result)) {
         /* ignore result */
@@ -593,7 +856,7 @@ static int lean_callback_trampoline(lua_State* L) {
 
     /* Get callback from upvalue */
     LeanCallbackContext* ctx = (LeanCallbackContext*)lua_touserdata(L, lua_upvalueindex(1));
-    if (!ctx || !ctx->callback) {
+    if (!ctx) {
         lua_pushstring(L, "Invalid callback context");
         lua_error(L);
         return 0;
@@ -607,10 +870,8 @@ static int lean_callback_trampoline(lua_State* L) {
         args = lean_array_push(args, val);
     }
 
-    /* Call Lean function: callback : Array Value -> IO (Array Value) */
-    lean_inc(ctx->callback);
-    lean_object* io_action = lean_apply_1(ctx->callback, args);
-    lean_object* io_result = lean_apply_1(io_action, lean_io_mk_world());
+    /* Call Lean function by id: callback : Array Value -> IO (Array Value) */
+    lean_object* io_result = selene_callback_invoke(ctx->id, args);
 
     /* Check for errors */
     if (!lean_io_result_is_ok(io_result)) {
@@ -643,19 +904,19 @@ static int lean_callback_trampoline(lua_State* L) {
 /* Garbage collection callback for Lean callback context */
 static int lean_callback_gc(lua_State* L) {
     LeanCallbackContext* ctx = (LeanCallbackContext*)lua_touserdata(L, 1);
-    if (ctx && ctx->callback) {
-        lean_dec(ctx->callback);
-        ctx->callback = NULL;
+    if (ctx) {
+        lean_object* io_result = (ctx->kind == CALLBACK_KIND_YIELDING)
+            ? selene_yielding_callback_release(ctx->id)
+            : selene_callback_release(ctx->id);
+        if (lean_io_result_is_ok(io_result)) {
+            /* ignore result */
+        }
+        lean_dec(io_result);
     }
     return 0;
 }
 
 static int lean_yielding_callback_call(lua_State* L, LeanCallbackContext* ctx);
-
-static int lean_yielding_callback_continue(lua_State* L, int status, lua_KContext ctx) {
-    (void)status;
-    return lean_yielding_callback_call(L, (LeanCallbackContext*)ctx);
-}
 
 static int lean_yielding_callback_trampoline(lua_State* L) {
     LeanCallbackContext* ctx = (LeanCallbackContext*)lua_touserdata(L, lua_upvalueindex(1));
@@ -663,7 +924,7 @@ static int lean_yielding_callback_trampoline(lua_State* L) {
 }
 
 static int lean_yielding_callback_call(lua_State* L, LeanCallbackContext* ctx) {
-    if (!ctx || !ctx->callback) {
+    if (!ctx) {
         lua_pushstring(L, "Invalid callback context");
         lua_error(L);
         return 0;
@@ -677,10 +938,8 @@ static int lean_yielding_callback_call(lua_State* L, LeanCallbackContext* ctx) {
         args = lean_array_push(args, val);
     }
 
-    /* Call Lean function: callback : Array Value -> IO CallbackResult */
-    lean_inc(ctx->callback);
-    lean_object* io_action = lean_apply_1(ctx->callback, args);
-    lean_object* io_result = lean_apply_1(io_action, lean_io_mk_world());
+    /* Call Lean function by id: callback : Array Value -> IO CallbackResult */
+    lean_object* io_result = selene_yielding_callback_invoke(ctx->id, args);
 
     /* Check for errors */
     if (!lean_io_result_is_ok(io_result)) {
@@ -709,36 +968,32 @@ static int lean_yielding_callback_call(lua_State* L, LeanCallbackContext* ctx) {
     unsigned tag = lean_obj_tag(result);
     lean_object* values = lean_ctor_get(result, 0);
     size_t nresults = lean_array_size(values);
+
+    /* Package results into a table and return (shouldYield, valuesTable). */
+    lua_pushboolean(L, tag == 1);
+    lua_createtable(L, (int)nresults, 0);
     for (size_t i = 0; i < nresults; i++) {
         lean_object* val = lean_array_get_core(values, i);
         lean_value_to_lua(L, val);
+        lua_rawseti(L, -2, (int)i + 1);
     }
     lean_dec(io_result);
-
-    if (tag == 0) {
-        return (int)nresults;
-    }
-    if (tag == 1) {
-        return lua_yieldk(L, (int)nresults, (lua_KContext)ctx, lean_yielding_callback_continue);
-    }
-
-    lua_pushstring(L, "Unknown callback result");
-    lua_error(L);
-    return 0;
+    return 2;
 }
 
-LEAN_EXPORT lean_obj_res selene_register_function(
+LEAN_EXPORT lean_obj_res selene_register_function_index(
     b_lean_obj_arg state_obj,
     b_lean_obj_arg name_obj,
-    lean_obj_arg callback,
+    uint64_t id,
     lean_obj_arg world
 ) {
-    lua_State* L = (lua_State*)lean_get_external_data(state_obj);
+    lua_State* L = state_from_obj(state_obj);
     const char* name = lean_string_cstr(name_obj);
 
     /* Create userdata for callback context */
     LeanCallbackContext* ctx = (LeanCallbackContext*)lua_newuserdata(L, sizeof(LeanCallbackContext));
-    ctx->callback = callback;  /* Takes ownership */
+    ctx->id = id;
+    ctx->kind = CALLBACK_KIND_NORMAL;
 
     /* Create metatable with __gc for cleanup */
     if (luaL_newmetatable(L, "LeanCallback")) {
@@ -756,18 +1011,19 @@ LEAN_EXPORT lean_obj_res selene_register_function(
     return lean_io_result_mk_ok(lean_box(0));
 }
 
-LEAN_EXPORT lean_obj_res selene_register_yielding_function(
+LEAN_EXPORT lean_obj_res selene_register_yielding_function_index(
     b_lean_obj_arg state_obj,
     b_lean_obj_arg name_obj,
-    lean_obj_arg callback,
+    uint64_t id,
     lean_obj_arg world
 ) {
-    lua_State* L = (lua_State*)lean_get_external_data(state_obj);
+    lua_State* L = state_from_obj(state_obj);
     const char* name = lean_string_cstr(name_obj);
 
     /* Create userdata for callback context */
     LeanCallbackContext* ctx = (LeanCallbackContext*)lua_newuserdata(L, sizeof(LeanCallbackContext));
-    ctx->callback = callback;  /* Takes ownership */
+    ctx->id = id;
+    ctx->kind = CALLBACK_KIND_YIELDING;
 
     /* Create metatable with __gc for cleanup */
     if (luaL_newmetatable(L, "LeanCallback")) {
@@ -779,9 +1035,47 @@ LEAN_EXPORT lean_obj_res selene_register_yielding_function(
     /* Create closure with callback context as upvalue */
     lua_pushcclosure(L, lean_yielding_callback_trampoline, 1);
 
-    /* Set as global */
-    lua_setglobal(L, name);
+    /* Store raw function under a private name */
+    const char* prefix = "__selene_yielding_";
+    size_t raw_len = strlen(prefix) + strlen(name) + 1;
+    char* raw_name = (char*)malloc(raw_len);
+    snprintf(raw_name, raw_len, "%s%s", prefix, name);
+    lua_setglobal(L, raw_name);
 
+    /* Build Lua wrapper that yields from Lua, not C */
+    const char* wrapper_src =
+        "local raw = ...\n"
+        "return function(...)\n"
+        "  local args = {...}\n"
+        "  while true do\n"
+        "    local shouldYield, vals = raw(table.unpack(args))\n"
+        "    if shouldYield then\n"
+        "      args = {coroutine.yield(table.unpack(vals))}\n"
+        "    else\n"
+        "      return table.unpack(vals)\n"
+        "    end\n"
+        "  end\n"
+        "end";
+
+    if (luaL_loadstring(L, wrapper_src) != LUA_OK) {
+        const char* err = lua_tostring(L, -1);
+        lean_object* result = mk_io_error(err ? err : "Failed to load yielding wrapper");
+        lua_pop(L, 1);
+        free(raw_name);
+        return result;
+    }
+
+    lua_getglobal(L, raw_name);
+    if (lua_pcall(L, 1, 1, 0) != LUA_OK) {
+        const char* err = lua_tostring(L, -1);
+        lean_object* result = mk_io_error(err ? err : "Failed to create yielding wrapper");
+        lua_pop(L, 1);
+        free(raw_name);
+        return result;
+    }
+
+    lua_setglobal(L, name);
+    free(raw_name);
     return lean_io_result_mk_ok(lean_box(0));
 }
 
@@ -792,7 +1086,7 @@ LEAN_EXPORT lean_obj_res selene_new_userdata(
 ) {
     init_external_classes();
 
-    lua_State* L = (lua_State*)lean_get_external_data(state_obj);
+    lua_State* L = state_from_obj(state_obj);
 
     LeanUserdata* ud = (LeanUserdata*)lua_newuserdatauv(L, sizeof(LeanUserdata), 0);
     ud->finalizer = finalizer_obj;  /* Takes ownership */
@@ -807,6 +1101,7 @@ LEAN_EXPORT lean_obj_res selene_new_userdata(
     LuaRefWrapper* wrapper = (LuaRefWrapper*)malloc(sizeof(LuaRefWrapper));
     wrapper->L = L;
     wrapper->ref = ref;
+    wrapper->state_id = find_state_id(L);
 
     lean_object* obj = lean_alloc_external(g_lua_ref_class, wrapper);
     return lean_io_result_mk_ok(obj);
@@ -815,19 +1110,20 @@ LEAN_EXPORT lean_obj_res selene_new_userdata(
 LEAN_EXPORT lean_obj_res selene_ref(b_lean_obj_arg state_obj, lean_obj_arg world) {
     init_external_classes();
 
-    lua_State* L = (lua_State*)lean_get_external_data(state_obj);
+    lua_State* L = state_from_obj(state_obj);
     int ref = luaL_ref(L, LUA_REGISTRYINDEX);
 
     LuaRefWrapper* wrapper = (LuaRefWrapper*)malloc(sizeof(LuaRefWrapper));
     wrapper->L = L;
     wrapper->ref = ref;
+    wrapper->state_id = find_state_id(L);
 
     lean_object* obj = lean_alloc_external(g_lua_ref_class, wrapper);
     return lean_io_result_mk_ok(obj);
 }
 
 LEAN_EXPORT lean_obj_res selene_unref(b_lean_obj_arg state_obj, b_lean_obj_arg ref_obj, lean_obj_arg world) {
-    lua_State* L = (lua_State*)lean_get_external_data(state_obj);
+    lua_State* L = state_from_obj(state_obj);
     LuaRefWrapper* wrapper = (LuaRefWrapper*)lean_get_external_data(ref_obj);
 
     if (wrapper && wrapper->ref != LUA_NOREF) {
@@ -839,7 +1135,7 @@ LEAN_EXPORT lean_obj_res selene_unref(b_lean_obj_arg state_obj, b_lean_obj_arg r
 }
 
 LEAN_EXPORT lean_obj_res selene_push_ref(b_lean_obj_arg state_obj, b_lean_obj_arg ref_obj, lean_obj_arg world) {
-    lua_State* L = (lua_State*)lean_get_external_data(state_obj);
+    lua_State* L = state_from_obj(state_obj);
     LuaRefWrapper* wrapper = (LuaRefWrapper*)lean_get_external_data(ref_obj);
 
     if (wrapper && wrapper->ref != LUA_NOREF) {
@@ -854,7 +1150,7 @@ LEAN_EXPORT lean_obj_res selene_push_ref(b_lean_obj_arg state_obj, b_lean_obj_ar
 LEAN_EXPORT lean_obj_res selene_to_value(b_lean_obj_arg state_obj, b_lean_obj_arg idx_obj, lean_obj_arg world) {
     init_external_classes();
 
-    lua_State* L = (lua_State*)lean_get_external_data(state_obj);
+    lua_State* L = state_from_obj(state_obj);
     int idx = (int)lean_int64_of_int(idx_obj);
 
     lean_object* val = lua_to_lean_value(L, idx);
@@ -863,7 +1159,7 @@ LEAN_EXPORT lean_obj_res selene_to_value(b_lean_obj_arg state_obj, b_lean_obj_ar
 
 /* Note: This shadows the FFI.Stack.pushValue function but with a different signature for Value */
 LEAN_EXPORT lean_obj_res selene_push_from_value(b_lean_obj_arg state_obj, b_lean_obj_arg val_obj, lean_obj_arg world) {
-    lua_State* L = (lua_State*)lean_get_external_data(state_obj);
+    lua_State* L = state_from_obj(state_obj);
     lean_value_to_lua(L, val_obj);
     return lean_io_result_mk_ok(lean_box(0));
 }
@@ -922,7 +1218,7 @@ static int coroutine_auxstatus(lua_State* L, lua_State* co) {
 LEAN_EXPORT lean_obj_res selene_new_thread(b_lean_obj_arg state_obj, lean_obj_arg world) {
     init_external_classes();
 
-    lua_State* L = (lua_State*)lean_get_external_data(state_obj);
+    lua_State* L = state_from_obj(state_obj);
     lua_newthread(L); /* pushes thread */
 
     /* Create registry ref for the thread (pops it) */
@@ -931,6 +1227,7 @@ LEAN_EXPORT lean_obj_res selene_new_thread(b_lean_obj_arg state_obj, lean_obj_ar
     LuaRefWrapper* wrapper = (LuaRefWrapper*)malloc(sizeof(LuaRefWrapper));
     wrapper->L = L;
     wrapper->ref = ref;
+    wrapper->state_id = find_state_id(L);
 
     lean_object* obj = lean_alloc_external(g_lua_ref_class, wrapper);
     return lean_io_result_mk_ok(obj);
@@ -939,13 +1236,14 @@ LEAN_EXPORT lean_obj_res selene_new_thread(b_lean_obj_arg state_obj, lean_obj_ar
 LEAN_EXPORT lean_obj_res selene_running_thread(b_lean_obj_arg state_obj, lean_obj_arg world) {
     init_external_classes();
 
-    lua_State* L = (lua_State*)lean_get_external_data(state_obj);
+    lua_State* L = state_from_obj(state_obj);
     int ismain = lua_pushthread(L);
 
     int ref = luaL_ref(L, LUA_REGISTRYINDEX);
     LuaRefWrapper* wrapper = (LuaRefWrapper*)malloc(sizeof(LuaRefWrapper));
     wrapper->L = L;
     wrapper->ref = ref;
+    wrapper->state_id = find_state_id(L);
 
     lean_object* thread_obj = lean_alloc_external(g_lua_ref_class, wrapper);
     lean_object* pair = lean_alloc_ctor(0, 2, 0);
@@ -982,6 +1280,7 @@ LEAN_EXPORT lean_obj_res selene_resume(b_lean_obj_arg co_obj, uint32_t nargs, le
 
     int nresults = 0;
     int status = lua_resume(co, wrapper->L, (int)nargs, &nresults);
+    flush_pending_finalizers();
 
     /* Return tuple: (status, nresults) */
     lean_object* pair = lean_alloc_ctor(0, 2, 0);
@@ -991,7 +1290,7 @@ LEAN_EXPORT lean_obj_res selene_resume(b_lean_obj_arg co_obj, uint32_t nargs, le
 }
 
 LEAN_EXPORT lean_obj_res selene_coroutine_status(b_lean_obj_arg state_obj, b_lean_obj_arg co_obj, lean_obj_arg world) {
-    lua_State* L = (lua_State*)lean_get_external_data(state_obj);
+    lua_State* L = state_from_obj(state_obj);
     LuaRefWrapper* wrapper = (LuaRefWrapper*)lean_get_external_data(co_obj);
     lua_State* co = thread_state_from_ref(wrapper);
     if (!L || !co) {
@@ -1012,7 +1311,7 @@ LEAN_EXPORT lean_obj_res selene_status(b_lean_obj_arg co_obj, lean_obj_arg world
 }
 
 LEAN_EXPORT lean_obj_res selene_close_thread(b_lean_obj_arg state_obj, b_lean_obj_arg co_obj, lean_obj_arg world) {
-    lua_State* L = (lua_State*)lean_get_external_data(state_obj);
+    lua_State* L = state_from_obj(state_obj);
     LuaRefWrapper* wrapper = (LuaRefWrapper*)lean_get_external_data(co_obj);
     lua_State* co = thread_state_from_ref(wrapper);
     if (!L || !co) {
@@ -1020,6 +1319,27 @@ LEAN_EXPORT lean_obj_res selene_close_thread(b_lean_obj_arg state_obj, b_lean_ob
     }
     int status = lua_closethread(co, L);
     return lean_io_result_mk_ok(lean_int_to_int(status));
+}
+
+LEAN_EXPORT lean_obj_res selene_thread_traceback(
+    b_lean_obj_arg state_obj,
+    b_lean_obj_arg co_obj,
+    b_lean_obj_arg msg_obj,
+    lean_obj_arg world
+) {
+    lua_State* L = state_from_obj(state_obj);
+    LuaRefWrapper* wrapper = (LuaRefWrapper*)lean_get_external_data(co_obj);
+    lua_State* co = thread_state_from_ref(wrapper);
+    if (!L || !co) {
+        return mk_io_error("Value is not a thread");
+    }
+
+    const char* msg = lean_string_cstr(msg_obj);
+    luaL_traceback(L, co, (msg && msg[0]) ? msg : NULL, 1);
+    const char* trace = lua_tostring(L, -1);
+    lean_object* result = lean_mk_string(trace ? trace : "");
+    lua_pop(L, 1);
+    return lean_io_result_mk_ok(result);
 }
 
 LEAN_EXPORT lean_obj_res selene_is_yieldable(b_lean_obj_arg co_obj, lean_obj_arg world) {
@@ -1033,7 +1353,7 @@ LEAN_EXPORT lean_obj_res selene_is_yieldable(b_lean_obj_arg co_obj, lean_obj_arg
 }
 
 LEAN_EXPORT lean_obj_res selene_is_thread(b_lean_obj_arg state_obj, b_lean_obj_arg idx_obj, lean_obj_arg world) {
-    lua_State* L = (lua_State*)lean_get_external_data(state_obj);
+    lua_State* L = state_from_obj(state_obj);
     int idx = (int)lean_int64_of_int(idx_obj);
     int result = lua_isthread(L, idx);
     return lean_io_result_mk_ok(lean_box(result ? 1 : 0));
@@ -1042,7 +1362,7 @@ LEAN_EXPORT lean_obj_res selene_is_thread(b_lean_obj_arg state_obj, b_lean_obj_a
 LEAN_EXPORT lean_obj_res selene_to_thread(b_lean_obj_arg state_obj, b_lean_obj_arg idx_obj, lean_obj_arg world) {
     init_external_classes();
 
-    lua_State* L = (lua_State*)lean_get_external_data(state_obj);
+    lua_State* L = state_from_obj(state_obj);
     int idx = (int)lean_int64_of_int(idx_obj);
 
     if (!lua_isthread(L, idx)) {
@@ -1055,6 +1375,7 @@ LEAN_EXPORT lean_obj_res selene_to_thread(b_lean_obj_arg state_obj, b_lean_obj_a
     LuaRefWrapper* wrapper = (LuaRefWrapper*)malloc(sizeof(LuaRefWrapper));
     wrapper->L = L;
     wrapper->ref = ref;
+    wrapper->state_id = find_state_id(L);
 
     lean_object* obj = lean_alloc_external(g_lua_ref_class, wrapper);
     return lean_io_result_mk_ok(obj);
@@ -1073,10 +1394,10 @@ LEAN_EXPORT lean_obj_res selene_xmove(b_lean_obj_arg from_obj, b_lean_obj_arg to
 }
 
 LEAN_EXPORT lean_obj_res selene_xmove_to_thread(b_lean_obj_arg from_obj, b_lean_obj_arg to_obj, uint32_t n, lean_obj_arg world) {
-    lua_State* from = (lua_State*)lean_get_external_data(from_obj);
+    lua_State* from = state_from_obj(from_obj);
     LuaRefWrapper* to_wrap = (LuaRefWrapper*)lean_get_external_data(to_obj);
     lua_State* to = thread_state_from_ref(to_wrap);
-    if (!to) {
+    if (!from || !to) {
         return mk_io_error("Value is not a thread");
     }
     lua_xmove(from, to, (int)n);
@@ -1086,8 +1407,8 @@ LEAN_EXPORT lean_obj_res selene_xmove_to_thread(b_lean_obj_arg from_obj, b_lean_
 LEAN_EXPORT lean_obj_res selene_xmove_from_thread(b_lean_obj_arg from_obj, b_lean_obj_arg to_obj, uint32_t n, lean_obj_arg world) {
     LuaRefWrapper* from_wrap = (LuaRefWrapper*)lean_get_external_data(from_obj);
     lua_State* from = thread_state_from_ref(from_wrap);
-    lua_State* to = (lua_State*)lean_get_external_data(to_obj);
-    if (!from) {
+    lua_State* to = state_from_obj(to_obj);
+    if (!from || !to) {
         return mk_io_error("Value is not a thread");
     }
     lua_xmove(from, to, (int)n);

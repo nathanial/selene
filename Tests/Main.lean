@@ -11,6 +11,7 @@ namespace Tests.Selene
 
 testSuite "Selene"
 
+
 test "State creation" := do
   let lua ← State.new
   let ver ← lua.version
@@ -226,6 +227,16 @@ test "Protected call" := do
   | .ok _ => throw (IO.userError "Expected error from pcall")
   lua.close
 
+test "Error includes stack trace" := do
+  let lua ← State.new
+  let result ← lua.exec "function boom() error('boom') end; boom()"
+  match result with
+  | .error (.runtime _ (some trace)) =>
+    ensure (!trace.isEmpty) "Expected stack traceback in error"
+  | .error _ => throw (IO.userError "Expected runtime error with trace")
+  | .ok _ => throw (IO.userError "Expected error from exec")
+  lua.close
+
 test "Coroutine basic creation" := do
   let lua ← State.new
   lua.exec! "function simple() return 42 end"
@@ -305,7 +316,9 @@ test "Coroutine error handling" := do
 
   let result ← co.resume
   match result with
-  | .error _ => pure ()
+  | .error (.runtime _ (some trace)) =>
+    ensure (!trace.isEmpty) "Expected stack traceback in coroutine error"
+  | .error _ => throw (IO.userError "Expected runtime error with trace")
   | _ => throw (IO.userError s!"Expected error, got {repr result}")
 
   lua.close
@@ -498,4 +511,8 @@ test "Coroutine yield from Lean" := do
 
 end Tests.Selene
 
-def main (args : List String) : IO UInt32 := runAllSuitesFiltered args
+def main (args : List String) : IO UInt32 :=
+  if args.isEmpty then
+    runAllSuites
+  else
+    runAllSuitesFiltered args

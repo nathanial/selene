@@ -20,6 +20,9 @@ structure State where
 
 namespace State
 
+private def traceFrom (trace : String) : Option String :=
+  if trace.isEmpty then none else some trace
+
 /-- Create a new Lua state with standard libraries -/
 def new : IO State := do
   let raw ← FFI.stateNewWithLibs
@@ -36,27 +39,53 @@ def close (s : State) : IO Unit :=
 
 /-- Execute a Lua string, throwing on error -/
 def exec! (s : State) (code : String) : IO Unit := do
-  match ← FFI.doString s.raw code with
-  | none => pure ()
-  | some err => throw (IO.userError err)
+  let result ← FFI.doString s.raw code
+  let status := result.fst
+  let msgTrace := result.snd
+  let msg := msgTrace.fst
+  let trace := msgTrace.snd
+  if status == FFI.LUA_OK then
+    pure ()
+  else
+    let err := LuaError.ofStatus status msg (traceFrom trace)
+    throw (IO.userError (toString err))
 
 /-- Execute a Lua string, returning result -/
 def exec (s : State) (code : String) : IO (LuaResult Unit) := do
-  match ← FFI.doString s.raw code with
-  | none => pure (.ok ())
-  | some err => pure (.error (.runtime err))
+  let result ← FFI.doString s.raw code
+  let status := result.fst
+  let msgTrace := result.snd
+  let msg := msgTrace.fst
+  let trace := msgTrace.snd
+  if status == FFI.LUA_OK then
+    pure (.ok ())
+  else
+    pure (.error (LuaError.ofStatus status msg (traceFrom trace)))
 
 /-- Load and execute a Lua file, throwing on error -/
 def execFile! (s : State) (path : String) : IO Unit := do
-  match ← FFI.doFile s.raw path with
-  | none => pure ()
-  | some err => throw (IO.userError err)
+  let result ← FFI.doFile s.raw path
+  let status := result.fst
+  let msgTrace := result.snd
+  let msg := msgTrace.fst
+  let trace := msgTrace.snd
+  if status == FFI.LUA_OK then
+    pure ()
+  else
+    let err := LuaError.ofStatus status msg (traceFrom trace)
+    throw (IO.userError (toString err))
 
 /-- Load and execute a Lua file, returning result -/
 def execFile (s : State) (path : String) : IO (LuaResult Unit) := do
-  match ← FFI.doFile s.raw path with
-  | none => pure (.ok ())
-  | some err => pure (.error (.runtime err))
+  let result ← FFI.doFile s.raw path
+  let status := result.fst
+  let msgTrace := result.snd
+  let msg := msgTrace.fst
+  let trace := msgTrace.snd
+  if status == FFI.LUA_OK then
+    pure (.ok ())
+  else
+    pure (.error (LuaError.ofStatus status msg (traceFrom trace)))
 
 /-- Get a global variable as a Value -/
 def getGlobal (s : State) (name : String) : IO Value := do
@@ -104,7 +133,11 @@ def pcall (s : State) (funcName : String) (args : Array Value) : IO (LuaResult (
   let _ ← FFI.getGlobal s.raw funcName
   for arg in args do
     FFI.pushFromValue s.raw arg
-  let status ← FFI.pcall s.raw args.size.toUInt32 0xFFFFFFFF
+  let result ← FFI.pcall s.raw args.size.toUInt32 0xFFFFFFFF
+  let status := result.fst
+  let msgTrace := result.snd
+  let msg := msgTrace.fst
+  let trace := msgTrace.snd
   if status == FFI.LUA_OK then
     let nResults ← FFI.getTop s.raw
     let mut results := #[]
@@ -115,9 +148,7 @@ def pcall (s : State) (funcName : String) (args : Array Value) : IO (LuaResult (
     FFI.pop s.raw nResults.toNat.toUInt32
     return .ok results
   else
-    let err ← FFI.toString s.raw (-1)
-    FFI.pop s.raw 1
-    return .error (LuaError.ofStatus status err)
+    return .error (LuaError.ofStatus status msg (traceFrom trace))
 
 /-- Register a Lean function as a Lua global -/
 def registerGlobal (s : State) (name : String) (f : Array Value → IO (Array Value)) : IO Unit :=

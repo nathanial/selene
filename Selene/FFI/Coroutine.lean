@@ -40,6 +40,10 @@ opaque status : @& LuaThread → IO Int
 @[extern "selene_close_thread"]
 opaque closeThread : @& LuaState → @& LuaThread → IO Int
 
+/-- Get a traceback for a coroutine thread with message. -/
+@[extern "selene_thread_traceback"]
+opaque threadTraceback : @& LuaState → @& LuaThread → @& String → IO String
+
 /-- Check if a coroutine can yield -/
 @[extern "selene_is_yieldable"]
 opaque isYieldable : @& LuaThread → IO Bool

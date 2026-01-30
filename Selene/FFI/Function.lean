@@ -5,6 +5,7 @@
 import Selene.FFI.Types
 import Selene.Core.Value
 import Selene.Core.Callback
+import Selene.CallbackRegistry
 
 namespace Selene.FFI
 
@@ -13,16 +14,27 @@ namespace Selene.FFI
 @[extern "selene_call"]
 opaque call : @& LuaState → UInt32 → UInt32 → IO Unit
 
+/-- Register a Lean function as a Lua global by callback id. -/
+@[extern "selene_register_function_index"]
+opaque registerFunctionIndex : @& LuaState → @& String → UInt64 → IO Unit
+
+/-- Register a Lean function as a Lua global that can yield by callback id. -/
+@[extern "selene_register_yielding_function_index"]
+opaque registerYieldingFunctionIndex : @& LuaState → @& String → UInt64 → IO Unit
+
 /-- Register a Lean function as a Lua global.
     The callback receives arguments as an array and returns an array of results. -/
-@[extern "selene_register_function"]
-opaque registerFunction : @& LuaState → @& String → (Array Selene.Value → IO (Array Selene.Value)) → IO Unit
+def registerFunction (state : @& LuaState) (name : @& String)
+    (callback : Array Selene.Value → IO (Array Selene.Value)) : IO Unit := do
+  let id ← Selene.registerCallback callback
+  registerFunctionIndex state name id
 
 /-- Register a Lean function as a Lua global that can yield.
     The callback receives arguments as an array and returns a CallbackResult. -/
-@[extern "selene_register_yielding_function"]
-opaque registerYieldingFunction :
-  @& LuaState → @& String → (Array Selene.Value → IO Selene.CallbackResult) → IO Unit
+def registerYieldingFunction (state : @& LuaState) (name : @& String)
+    (callback : Array Selene.Value → IO Selene.CallbackResult) : IO Unit := do
+  let id ← Selene.registerYieldingCallback callback
+  registerYieldingFunctionIndex state name id
 
 /-- Create a reference to the value on top of stack in the registry.
     Pops the value and returns a LuaRef. -/

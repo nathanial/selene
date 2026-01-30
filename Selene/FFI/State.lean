@@ -18,18 +18,18 @@ opaque stateNewWithLibs : IO LuaState
 @[extern "selene_state_close"]
 opaque stateClose : @& LuaState → IO Unit
 
-/-- Execute a Lua string, returns error message on failure -/
+/-- Execute a Lua string, returns (status, message, trace). -/
 @[extern "selene_do_string"]
-opaque doString : @& LuaState → @& String → IO (Option String)
+opaque doString : @& LuaState → @& String → IO (Int × String × String)
 
-/-- Load and execute a Lua file, returns error message on failure -/
+/-- Load and execute a Lua file, returns (status, message, trace). -/
 @[extern "selene_do_file"]
-opaque doFile : @& LuaState → @& String → IO (Option String)
+opaque doFile : @& LuaState → @& String → IO (Int × String × String)
 
 /-- Protected call of function on stack with nargs arguments and nresults results.
-    Returns status code (LUA_OK on success). -/
+    Returns (status, message, trace). -/
 @[extern "selene_pcall"]
-opaque pcall : @& LuaState → UInt32 → UInt32 → IO Int
+opaque pcall : @& LuaState → UInt32 → UInt32 → IO (Int × String × String)
 
 /-- Get Lua version number -/
 @[extern "selene_version"]

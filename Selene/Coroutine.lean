@@ -71,6 +71,9 @@ structure Coroutine where
 
 namespace Coroutine
 
+private def traceFrom (trace : String) : Option String :=
+  if trace.isEmpty then none else some trace
+
 /-- Get the current status of the coroutine -/
 def getStatus (co : Coroutine) : IO CoroutineStatus := do
   let status ← FFI.coroutineStatus co.parent co.thread
@@ -117,11 +120,12 @@ def resume (co : Coroutine) (args : Array Value := #[]) : IO ResumeResult := do
   else
     -- Error occurred
     let errMsg ← FFI.coToValue co.thread (-1)
-    FFI.coPop co.thread 1
     let msg := match errMsg with
       | .string s => s
       | _ => "Unknown coroutine error"
-    return .error (LuaError.ofStatus status msg)
+    let trace ← FFI.threadTraceback co.parent co.thread msg
+    FFI.coPop co.thread 1
+    return .error (LuaError.ofStatus status msg (traceFrom trace))
 
 /-- Resume the coroutine with lifecycle hooks. -/
 def resumeWithHooks (co : Coroutine) (hooks : CoroutineHooks) (args : Array Value := #[]) : IO ResumeResult := do
@@ -138,18 +142,19 @@ def close (co : Coroutine) : IO (LuaResult Unit) := do
   let status ← co.getStatus
   match status with
   | .running | .normal =>
-    return .error (.runtime s!"cannot close a {status} coroutine")
+    return .error (.runtime s!"cannot close a {status} coroutine" none)
   | .suspended | .dead =>
     let closeStatus ← FFI.closeThread co.parent co.thread
     if closeStatus == FFI.LUA_OK then
       return .ok ()
     else
       let errMsg ← FFI.coToValue co.thread (-1)
-      FFI.coPop co.thread 1
       let msg := match errMsg with
         | .string s => s
         | _ => "Unknown coroutine error"
-      return .error (LuaError.ofStatus closeStatus msg)
+      let trace ← FFI.threadTraceback co.parent co.thread msg
+      FFI.coPop co.thread 1
+      return .error (LuaError.ofStatus closeStatus msg (traceFrom trace))
 
 /-- Close the coroutine thread with lifecycle hooks. -/
 def closeWithHooks (co : Coroutine) (hooks : CoroutineHooks) : IO (LuaResult Unit) := do
